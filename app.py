@@ -15,9 +15,14 @@
 #     ทำให้ทั้งแถวอ่านไม่ได้เลย) + แก้ปัญหาช่อง Lot Number ว่างที่เคยถูกหยิบ
 #     คำท้ายของ description ไปเป็น lot ผิดๆ ด้วย get_vertical_edge_xs() +
 #     get_lot_column_left_x() (ปลอดภัย: ถ้าหาขอบคอลัมน์ไม่เจอ ทำงานเหมือนเดิม)
-#   STEP 5 (รอบ 4): get_core_name_candidates() เพิ่ม candidate จากเนื้อหาใน
-#     วงเล็บด้วย เผื่อคีย์เวิร์ดหลักของสินค้าถูกใส่ไว้ในวงเล็บแทนที่จะเป็นแค่
-#     บรรจุภัณฑ์ (เพิ่มเข้าไปในลิสต์เท่านั้น ไม่กระทบคู่ที่เคยจับถูกอยู่แล้ว)
+#   STEP 5 (รอบ 9): เปลี่ยนวิธีจับกลุ่มสินค้าใหม่ทั้งหมด จากเดิมที่ใช้ความคล้าย
+#     ชื่อแบบ fuzzy (core name candidates + CORE_NAME_THRESHOLD) เปลี่ยนเป็น
+#     หลักการ "Lot ก่อน ชื่อเป๊ะทีหลัง": Lot ตรงกันเป๊ะ หรือ ชื่อฐานหลังตัด
+#     หน่วย/วงเล็บเหมือนกันเป๊ะเท่านั้นถึงจะถือเป็นสินค้าเดียวกัน (ไม่มี fuzzy/
+#     threshold อีกต่อไป) ส่วนการตรวจ Trix ตัดสินจากยอดรวมของกลุ่มแทนการเทียบ
+#     ทีละบรรทัด และเพิ่มการตรวจ Lot รายล็อตแยกต่างหาก (lot_level_mismatch)
+#     ผลคือสไลเดอร์ "เกณฑ์แก่นชื่อสำรอง" ในแถบตั้งค่าถูกถอดออก เพราะไม่มีผลกับ
+#     โค้ดจับคู่สินค้าอีกต่อไป
 # ==================================================================
 
 import os
@@ -756,8 +761,30 @@ def process_do_uploads(uploaded_files):
 
 # ==================================================================
 # ============ STEP 5: เปรียบเทียบ PO vs DO ============
-#   [โค้ดเดิมทั้งหมดจากเวอร์ชันที่แก้ไขล่าสุด — ไม่แก้ logic เพิ่ม
-#    เปลี่ยนแค่ชื่อ UNIT_PATTERN -> WEIGHT_UNIT_PATTERN กันชนกับ STEP 3]
+#   [อัปเดตรอบ 9] เปลี่ยนวิธีจับกลุ่มสินค้าใหม่ทั้งหมด จากเดิมที่ใช้ความคล้าย
+#   ชื่อแบบ fuzzy (core name candidates) เปลี่ยนเป็นหลักการ "Lot ก่อน ชื่อเป๊ะ
+#   ทีหลัง": Lot ตรงกันเป๊ะ หรือ ชื่อฐานหลังตัดหน่วย/วงเล็บเหมือนกันเป๊ะเท่านั้น
+#   ถึงจะถือเป็นสินค้าเดียวกัน (ไม่มี fuzzy/threshold อีกต่อไป) ส่วนการตรวจ Trix
+#   ตัดสินจากยอดรวมของกลุ่มแทนการเทียบทีละบรรทัด และเพิ่มการตรวจ Lot รายล็อต
+#   แยกต่างหาก (lot_level_mismatch)
+#
+#   ⚠️ ตัวแปร UNIT_PATTERN ของโค้ดต้นฉบับ เปลี่ยนชื่อเป็น WEIGHT_UNIT_PATTERN
+#   ในไฟล์นี้ เพื่อไม่ให้ชนกับ UNIT_PATTERN ของ STEP 3 (เหตุผลเดียวกับรอบที่แล้ว)
+#
+#   [ประวัติการแก้ไขของ Step 5]
+#   รอบ 9 (รอบนี้): กรณี 4 (Trix) เพิ่มเงื่อนไข (ค) บรรทัด DO ที่ Lot ตรงกับบรรทัด PO
+#          ที่ระบุ (T) ให้นับเป็น Trix ด้วย แม้ชื่อใน DO จะไม่มีคำว่า TRIX/(T)
+#          และเปลี่ยนจากเทียบ dict (d not in ok_lines) เป็นใช้ index แทน
+#   รอบ 8: WEIGHT_UNIT_PATTERN ตัด "/CAN", "/BAG" ที่เขียนนอกวงเล็บด้วย
+#          (เช่น "D-PLUS (xxx) 20KG/CAN" ได้ key เดียวกับ "D-PLUS (20kg/can)")
+#   รอบ 1-5: fuzzy/core matching, candidate หลายแบบ, กันรหัสรุ่นขัดแย้ง,
+#            เช็ค Trix เฉพาะบรรทัด PO ที่เป็น (T)
+#   รอบ 7: กรณี 4 (Trix) ตัดสินจากยอดรวม + ยอมรับ DO ที่เป็น (T) หรือ TRIX
+#   รอบ 6: เลิก fuzzy/prefix ทั้งหมด (ทำให้ DIPSO คนละรุ่นถูกรวมกัน)
+#     - lots_compatible เทียบตรงตัวเท่านั้น (ไม่ใช้ prefix)
+#     - เพิ่ม base_name_key() เทียบชื่อฐานแบบเป๊ะ
+#     - group_items_by_name เหลือ 2 กฎข้างบน
+#     - กรณี 5 เช็ค Lot รายล็อตด้วย lot_level_mismatch()
 # ==================================================================
 
 TOLERANCE = 0.01
@@ -765,13 +792,12 @@ SIMILARITY_THRESHOLD = 0.8
 COMPANY_WEAK_THRESHOLD = 0.4
 COMPANY_WEIGHT_TOLERANCE_RATIO = 0.05
 
-CORE_NAME_THRESHOLD = 0.5
-CORE_WEIGHT_TOLERANCE_RATIO = 0.02
 WEIGHT_UNIT_PATTERN = re.compile(
-    r"\b\d+(\.\d+)?\s*(KG|G|GRAM|GRAMS|L|LITER|LITRE|ML|TON|TONS|BAG|BAGS|CAN|CANS|DRUM|DRUMS|PACK|PACKS|PCS?|SET|SETS)\b",
+    r"\b\d+(\.\d+)?\s*(KG|G|GRAM|GRAMS|L|LITER|LITRE|ML|TON|TONS|BAG|BAGS|CAN|CANS|DRUM|DRUMS|PACK|PACKS|PCS?|SET|SETS)\b"
+    # [รอบ 8] กินส่วนต่อท้ายแบบ /CAN /BAG ที่เขียนนอกวงเล็บด้วย
+    r"(\s*/\s*(CAN|CANS|BAG|BAGS|DRUM|DRUMS|PACK|PACKS|PCS?|SET|SETS|BOX|BOXES|BOTTLE|BOTTLES|PAIL|PAILS|TANK|TANKS)\b)?",
     flags=re.IGNORECASE,
 )
-VARIANT_TOKEN_MAX_LEN = 6
 
 
 def requires_trix(desc):
@@ -779,136 +805,50 @@ def requires_trix(desc):
 
 
 def is_trix_variant(desc):
-    return bool(re.search(r"\bTrix\b", desc or "", flags=re.IGNORECASE))
+    """จับคำว่า TRIX แบบไม่พึ่งขอบคำ: ตัดทุกอย่างที่ไม่ใช่ตัวอักษร/ตัวเลขทิ้งก่อน
+    แล้วหา 'TRIX' เป็น substring (รองรับ '-TRIX', '_TRIX', 'T R I X' ฯลฯ)"""
+    squashed = re.sub(r"[^A-Za-z0-9]", "", str(desc or "")).upper()
+    return "TRIX" in squashed
 
 
-def extract_variant_tokens(text):
-    s = WEIGHT_UNIT_PATTERN.sub(" ", str(text or ""))
-    tokens = re.findall(r"[A-Za-z0-9\-]+", s.upper())
-    return {t for t in tokens if re.search(r"\d", t) and len(t) <= VARIANT_TOKEN_MAX_LEN}
+def is_trix_ok(desc):
+    """[รอบ 7] PO เบิกเป็น (T) -> DO ยอมรับได้ทั้งที่มี (T) และที่มี TRIX"""
+    return is_trix_variant(desc) or requires_trix(desc)
 
 
-def has_conflicting_variant_code(a, b):
-    tokens_a = extract_variant_tokens(a)
-    tokens_b = extract_variant_tokens(b)
-    if not tokens_a or not tokens_b:
-        return False
-    return tokens_a.isdisjoint(tokens_b)
-
-
-def desc_similarity(a, b):
-    a, b = (a or "").upper().strip(), (b or "").upper().strip()
-    if not a or not b:
-        return 0.0
-    shorter, longer = sorted([a, b], key=len)
-    if len(shorter) >= 3 and longer.startswith(shorter):
-        return 1.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def _normalize_core_text(s):
-    s = WEIGHT_UNIT_PATTERN.sub(" ", s)
-    s = s.upper()
-    s = re.sub(r"[^A-Z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def get_core_name_candidates(desc):
-    """[รอบ 4] นอกจากตัวเลือกเดิม (เก็บ/ตัดข้อความในเครื่องหมายคำพูด, เอาเฉพาะ
-    ข้อความในเครื่องหมายคำพูด) ยังเพิ่ม candidate จากเนื้อหาในวงเล็บด้วย เพราะ
-    พบเคสที่คีย์เวิร์ดหลักของสินค้าถูกใส่ไว้ในวงเล็บแทนที่จะเป็นแค่บรรจุภัณฑ์
-    เช่น 'Dicalite Flux-Calcined Diatomaceous Earth (DE) (DICALITE
-    SPEEDPLUS)' vs 'DICALITE Speedplus (22.7kg/bag)' — เพิ่มเข้าไปในลิสต์
-    เท่านั้น ไม่ได้ลบ candidate เดิมออกเลย จึงไม่กระทบคู่ที่เคยจับถูกอยู่แล้ว"""
-    s = str(desc or "")
-    without_parens = re.sub(r"\([^)]*\)", " ", s)
-    quoted_texts = re.findall(r'"([^"]*)"', without_parens) + re.findall(r"'([^']*)'", without_parens)
-
-    keep_quotes = without_parens.replace('"', " ").replace("'", " ")
-    no_quotes = re.sub(r"'[^']*'", " ", re.sub(r'"[^"]*"', " ", without_parens))
-
-    # [รอบ 4] เผื่อข้อความในวงเล็บคือชื่อจริง ไม่ใช่แค่บรรจุภัณฑ์
-    paren_texts = re.findall(r"\(([^)]*)\)", s)      # เนื้อหาแต่ละวงเล็บ แยกเป็น candidate เดี่ยว
-    keep_parens_content = re.sub(r"[()]", " ", s)     # ทั้งข้อความ แค่ตัดสัญลักษณ์วงเล็บออก เนื้อหายังอยู่ครบ
-
-    raw_candidates = [keep_quotes, no_quotes, keep_parens_content] + list(quoted_texts) + list(paren_texts)
-    seen = set()
-    result = []
-    for c in raw_candidates:
-        c = _normalize_core_text(c)
-        if c and c not in seen:
-            seen.add(c)
-            result.append(c)
-    return result
-
-
-def _core_pair_score(core_a, core_b):
-    tokens_a, tokens_b = core_a.split(), core_b.split()
-    set_a, set_b = set(tokens_a), set(tokens_b)
-    union_size = len(set_a | set_b)
-    jaccard = len(set_a & set_b) / union_size if union_size else 0.0
-    ratio = SequenceMatcher(None, core_a, core_b).ratio()
-
-    acronym_score = 0.0
-    common = set_a & set_b
-    rem_a = [t for t in tokens_a if t not in common]
-    rem_b = [t for t in tokens_b if t not in common]
-    if rem_a and rem_b:
-        longer_rem, shorter_rem = (rem_a, rem_b) if len(rem_a) >= len(rem_b) else (rem_b, rem_a)
-        if len(longer_rem) >= 2 and len(shorter_rem) == 1:
-            acronym = "".join(t[0] for t in longer_rem)
-            if acronym == shorter_rem[0]:
-                acronym_score = 1.0
-
-    return max(jaccard, ratio, acronym_score)
-
-
-def core_desc_similarity(a, b):
-    candidates_a = get_core_name_candidates(a)
-    candidates_b = get_core_name_candidates(b)
-    if not candidates_a or not candidates_b:
-        return 0.0
-
-    best = 0.0
-    for core_a in candidates_a:
-        for core_b in candidates_b:
-            score = _core_pair_score(core_a, core_b)
-            if score > best:
-                best = score
-    return best
-
-
-def normalize_lot_prefix(lot):
+def lot_key(lot):
+    """'60318-00 (THS333/66)' -> '60318' ; '2171591' -> '2171591'
+    เทียบตรงตัวเท่านั้น ไม่ใช้ prefix"""
     s = str(lot or "").strip().upper()
     m = re.match(r"[A-Z0-9]+", s)
     return m.group(0) if m else s
 
 
 def lots_compatible(lot_a, lot_b):
-    a, b = normalize_lot_prefix(lot_a), normalize_lot_prefix(lot_b)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    shorter, longer = sorted([a, b], key=len)
-    return len(shorter) >= 3 and longer.startswith(shorter)
+    a, b = lot_key(lot_a), lot_key(lot_b)
+    return bool(a) and a == b
 
 
-def quantities_close(qty_a, qty_b, tol_ratio=None):
-    if tol_ratio is None:
-        tol_ratio = CORE_WEIGHT_TOLERANCE_RATIO
-    try:
-        a, b = float(qty_a), float(qty_b)
-    except (TypeError, ValueError):
-        return False
-    if a == 0 and b == 0:
-        return True
-    tol = max(TOLERANCE, tol_ratio * max(abs(a), abs(b)))
-    return abs(a - b) <= tol
+def base_name_key(desc):
+    """ชื่อฐานแบบเข้ม: ตัดวงเล็บ (T)/บรรจุภัณฑ์, หน่วย, TRIX, สัญลักษณ์และช่องว่าง
+    'DIPSO -F (20KG/CAN)-TRIX' -> 'DIPSOF'
+    'DIPSO H (20KG/CAN)-TRIX'  -> 'DIPSOH'
+    'DIPSO C-12 (20KG/BAG)'    -> 'DIPSOC12'
+    'GON PLATING\\n(20KG/BAG)'  -> 'GONPLATING'
+    'XXX-PLUS (XXX) 20KG/CAN'  -> 'XXXPLUS'  [รอบ 8]
+    'XXX-PLUS (20kg/can)'      -> 'XXXPLUS'"""
+    s = str(desc or "")
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = WEIGHT_UNIT_PATTERN.sub(" ", s)
+    s = re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    return s.replace("TRIX", "")
 
 
 def group_items_by_name(po, do):
+    """รวม PO+DO items เป็นกลุ่มสินค้าเดียวกัน (Union-Find)
+    กฎ 1) Lot เดียวกัน -> รวม
+    กฎ 2) ชื่อฐานเหมือนกันเป๊ะ -> รวม
+    (ไม่มี fuzzy / prefix)"""
     items = []
     for _, row in po.iterrows():
         items.append({"source": "PO", "lot_number": row["lot_number"], "description": row["description"],
@@ -931,27 +871,46 @@ def group_items_by_name(po, do):
         if ra != rb:
             parent[ra] = rb
 
+    keys = [base_name_key(it["description"]) for it in items]
+
     for i in range(n):
         for j in range(i + 1, n):
             if find(i) == find(j):
                 continue
 
-            if has_conflicting_variant_code(items[i]["description"], items[j]["description"]):
-                continue
-
-            if desc_similarity(items[i]["description"], items[j]["description"]) >= SIMILARITY_THRESHOLD:
+            # กฎ 1: Lot เดียวกัน = สินค้าเดียวกัน
+            if lots_compatible(items[i]["lot_number"], items[j]["lot_number"]):
                 union(i, j)
                 continue
 
-            if core_desc_similarity(items[i]["description"], items[j]["description"]) >= CORE_NAME_THRESHOLD:
-                if lots_compatible(items[i]["lot_number"], items[j]["lot_number"]) and \
-                   quantities_close(items[i]["quantity"], items[j]["quantity"]):
-                    union(i, j)
+            # กฎ 2: คนละ Lot แต่ชื่อฐานเหมือนกันเป๊ะ
+            if keys[i] and keys[i] == keys[j]:
+                union(i, j)
 
     groups = {}
     for i, it in enumerate(items):
         groups.setdefault(find(i), []).append(it)
     return list(groups.values())
+
+
+def lot_level_mismatch(po_items, do_items):
+    """คืนรายการ Lot ที่มีปัญหา: PO ไม่มีคู่ใน DO / น้ำหนักรายล็อตไม่ตรง / DO มี Lot ที่ PO ไม่มี"""
+    def bucket(items):
+        b = {}
+        for it in items:
+            k = lot_key(it["lot_number"])
+            b[k] = b.get(k, 0) + it["quantity"]
+        return b
+
+    pb, db = bucket(po_items), bucket(do_items)
+    bad = []
+    for k, q in pb.items():
+        if k not in db or abs(db[k] - q) > TOLERANCE:
+            bad.append(k)
+    for k in db:
+        if k not in pb:
+            bad.append(k)
+    return bad
 
 
 def compare_po_do(items_df, do_items_df):
@@ -980,47 +939,72 @@ def compare_po_do(items_df, do_items_df):
         order_id = ", ".join(do_refs) if do_refs else "-"
         diff = round(do_total - po_total, 3)
 
+        # กรณี 1: PO สั่งไว้ แต่ไม่มีใน DO เลย
         if po_items and not do_items:
             rows.append({"order_id": "-", "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
                          "สถานะ": "❌ ไม่พบชื่อสินค้าโปรดตรวจสอบอีกครั้ง"})
             continue
 
+        # กรณี 2: มีใน DO แต่ PO ไม่ได้สั่ง
         if do_items and not po_items:
             rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": do_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
                          "สถานะ": "⚠️ อาจมีสินค้าเกินโปรดตรวจสอบอีกครั้ง"})
             continue
 
+        # กรณี 3: จำนวนรวมไม่ตรงกัน (สำคัญที่สุด)
         if abs(po_total - do_total) > TOLERANCE:
             rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
                          "สถานะ": "❌ ตรวจสอบจำนวนอีกครั้ง"})
             continue
 
-        po_needs_trix = any(requires_trix(it["description"]) for it in po_items)
-        do_has_nontrix = any(not is_trix_variant(it["description"]) for it in do_items)
-        do_has_trix = any(is_trix_variant(it["description"]) for it in do_items)
+        # กรณี 4: เช็ค Trix เฉพาะสินค้าที่ PO เบิกเป็น (T)  [แก้ในรอบ 9]
+        #   ตัดสินจาก "ยอดรวมของกลุ่ม" (PO (T) รวม เทียบ DO ที่นับเป็น Trix รวม)
+        #   บรรทัด DO นับเป็น Trix ได้ 3 ทาง:
+        #     (ก) ชื่อมี (T) หรือ TRIX
+        #     (ข) Lot เดียวกับบรรทัด DO อื่นที่ชื่อมี (T)/TRIX
+        #     (ค) Lot เดียวกับบรรทัด PO ที่ระบุ (T)   <-- เพิ่มใหม่รอบ 9
+        #   ใช้ index แทนการเทียบ dict เพื่อกันบรรทัดที่ค่าซ้ำกันปนกัน
+        required_t = sum(it["quantity"] for it in po_items if requires_trix(it["description"]))
+        if required_t > TOLERANCE:
+            po_t_lots = {lot_key(p["lot_number"]) for p in po_items
+                         if requires_trix(p["description"]) and lot_key(p["lot_number"])}
+            marked_lots = {lot_key(d["lot_number"]) for d in do_items
+                           if is_trix_ok(d["description"]) and lot_key(d["lot_number"])}
 
-        if po_needs_trix and do_has_nontrix:
-            rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
-                         "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
-                         "สถานะ": "❌ เบิกผิดชนิดสินค้า (ต้องเบิก Trix แต่มีรุ่นธรรมดาปนมา)"})
-            continue
-        if not po_needs_trix and do_has_trix:
-            rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
-                         "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
-                         "สถานะ": "❌ เบิกผิดชนิดสินค้า (ไม่ต้องเบิก Trix แต่มีรุ่น Trix ปนมา)"})
-            continue
+            ok_idx, bad_idx = [], []
+            for idx, d in enumerate(do_items):
+                lk = lot_key(d["lot_number"])
+                if is_trix_ok(d["description"]) or lk in marked_lots or lk in po_t_lots:
+                    ok_idx.append(idx)
+                else:
+                    bad_idx.append(idx)
 
-        if po_lots != do_lots:
-            rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
+            got_t = sum(do_items[i]["quantity"] for i in ok_idx)
+            if got_t < required_t - TOLERANCE:
+                bad = [do_items[i] for i in bad_idx]
+                bad_lots = ", ".join(sorted({str(d["lot_number"]) for d in bad})) or "-"
+                rows.append({"order_id": order_id, "lot_number": bad_lots, "สินค้า": rep_desc,
+                             "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
+                             "สถานะ": f"❌ อาจเบิกผิดชนิดสินค้า (PO เบิก (T) {required_t:g} แต่ DO เป็น (T)/TRIX {got_t:g}) — Lot ที่ไม่ใช่ Trix: {bad_lots}"})
+                continue
+
+        # กรณี 5: จำนวนรวมตรง แต่รายล็อตไม่ตรง (เตือนเฉยๆ)
+        bad_lots = lot_level_mismatch(po_items, do_items)
+        if bad_lots:
+            rows.append({"order_id": order_id, "lot_number": ", ".join(bad_lots), "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
                          "สถานะ": "⚠️ มี Lot ไม่ตรง"})
             continue
 
     return pd.DataFrame(rows)
 
+
+# ==================================================================
+# ตารางเทียบน้ำหนักรวมระดับบริษัท (PO vs DO)  — ไม่เปลี่ยนจากเดิม
+# ==================================================================
 
 def normalize_company_name(s):
     s = str(s or "")
@@ -1105,6 +1089,7 @@ def build_company_compare_table(po_totals, do_totals, threshold=None):
 
 
 def style_company_compare(compare_df):
+    """ไฮไลต์ทั้งแถว: เขียว = น้ำหนักตรงกัน, แดง = ไม่ตรงกัน/หาคู่ไม่เจอ"""
     def highlight_row(row):
         color = "background-color: #C6EFCE" if row["สถานะ"] == "✅ ตรงกัน" else "background-color: #FFC7CE"
         return [color] * len(row)
@@ -1156,7 +1141,7 @@ def build_excel_report(company_compare_df, mismatch_df):
 # ==================================================================
 
 def main():
-    global SIMILARITY_THRESHOLD, TOLERANCE, CORE_NAME_THRESHOLD
+    global SIMILARITY_THRESHOLD, TOLERANCE
 
     st.title("📋 ระบบตรวจสอบ PO vs DO")
     st.caption("อัปโหลดไฟล์ PO (Inventory Issue) และ DO (Delivery Order) เพื่อเปรียบเทียบยอดสินค้าและน้ำหนักอัตโนมัติ")
@@ -1172,14 +1157,12 @@ def main():
         st.header("⚙️ ตั้งค่าขั้นสูง")
         st.caption("ปรับได้ถ้าเจอเคสแปลกๆ ไม่แน่ใจไม่ต้องแก้ ใช้ค่าเริ่มต้นได้เลย")
         similarity_threshold_ui = st.slider(
-            "ความคล้ายชื่อสินค้าขั้นต่ำ", 0.50, 1.00, SIMILARITY_THRESHOLD, 0.01,
-            help="ค่ายิ่งสูง ยิ่งเข้มงวด ต้องชื่อคล้ายกันมากถึงจะจับกลุ่มเป็นสินค้าเดียวกัน")
+            "ความคล้ายชื่อบริษัทขั้นต่ำ", 0.50, 1.00, SIMILARITY_THRESHOLD, 0.01,
+            help="ใช้ตอนจับคู่ชื่อบริษัทระหว่างตาราง PO กับ DO เท่านั้น ค่ายิ่งสูง ยิ่งเข้มงวด "
+                 "(การจับกลุ่ม 'รายการที่ไม่ตรง' ตอนนี้ใช้ Lot/ชื่อสินค้าตรงเป๊ะ ไม่ใช้ค่านี้แล้ว)")
         tolerance_ui = st.number_input(
             "ค่าคลาดเคลื่อนจำนวน/น้ำหนักที่ยอมรับได้", 0.0, 50.0, TOLERANCE, 0.01,
             help="ถ้าจำนวน PO กับ DO ต่างกันไม่เกินนี้ ถือว่าตรงกัน")
-        core_threshold_ui = st.slider(
-            "เกณฑ์แก่นชื่อสำรอง (สำหรับชื่อที่ถูกย่อ/ตัดคำ)", 0.0, 1.0, CORE_NAME_THRESHOLD, 0.05,
-            help="ใช้ตอนชื่อเต็มไม่คล้ายกันตรงๆ แต่ล็อตและน้ำหนักตรงกัน")
 
         st.divider()
         st.caption("🔒 ข้อมูลที่อัปโหลดจะถูกประมวลผลในหน่วยความจำชั่วคราวเท่านั้น ไม่ถูกบันทึกลงดิสก์ถาวร และจะหายไปเมื่อกดล้างข้อมูลหรือปิดหน้าเว็บ")
@@ -1214,7 +1197,6 @@ def main():
         else:
             SIMILARITY_THRESHOLD = similarity_threshold_ui
             TOLERANCE = tolerance_ui
-            CORE_NAME_THRESHOLD = core_threshold_ui
 
             with st.spinner("กำลังอ่านไฟล์ PO..."):
                 items_df, po_failed, po_logs = process_po_uploads(po_files)
