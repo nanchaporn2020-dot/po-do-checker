@@ -1,26 +1,26 @@
 # ==================================================================
 # PO vs DO Checker — Streamlit Web App
 #   รวม logic จาก STEP 3 (อ่าน PO), STEP 4 (อ่าน DO), STEP 5 (เปรียบเทียบ)
-#   มาห่อด้วย UI สำหรับอัปโหลดไฟล์ผ่านเว็บแทนการอ่านจากโฟลเดอร์
+#   ห่อด้วย UI สำหรับอัปโหลดไฟล์ผ่านเว็บแทนการอ่านจากโฟลเดอร์
 #
-#   ⚠️ หมายเหตุจุดที่ต้องระวังตอนรวมไฟล์:
-#   STEP 3 มีตัวแปรชื่อ UNIT_PATTERN (จับคำหน่วยล้วนๆ เช่น 'KG')
-#   STEP 5 ก็มีตัวแปรชื่อ UNIT_PATTERN เหมือนกันแต่ regex คนละแบบ
-#   (จับ 'ตัวเลข+หน่วย' เช่น '20KG' เพื่อตัดออกจากชื่อสินค้า)
-#   ถ้าใช้ชื่อซ้ำกันในไฟล์เดียวกัน ตัวหลังจะทับตัวแรกจนอ่าน PO พังทันที
-#   จึงเปลี่ยนชื่อของฝั่ง STEP 5 เป็น WEIGHT_UNIT_PATTERN แทน (logic เดิมทุกจุด)
+#   [เวอร์ชันนี้]
+#   STEP 3 = รอบ 34 (ระบบ Hybrid เลือกวิธีอ่านอัตโนมัติ cell-based/block-based,
+#            แบ่งกลุ่มบริษัทตามเลข No., ตัดรหัสนำหน้าชื่อสินค้า MCC-02/04/07, BZn-21)
+#   STEP 4 = เดิม (ไม่เปลี่ยน)
+#   STEP 5 = รอบ 20 (จับกลุ่มสินค้า "ชื่อก่อน Lot ยืนยัน", Lot หลายรหัส/วันที่,
+#            Trix ตามจำนวน, เทียบแยกตามบริษัท compare_po_do_by_company)
 #
-#   [อัปเดตล่าสุด]
-#   STEP 3 (รอบ 33): ระบบ Hybrid เลือกวิธีอ่านอัตโนมัติ (เส้นทางเซลล์ vs บล็อก)
-#   STEP 5 (รอบ 13): จับกลุ่มสินค้าด้วยชื่อก่อน (ชื่อฐาน/ชื่อในวงเล็บ/ตัวย่อ)
-#     แล้วใช้ Lot ช่วยเฉพาะกลุ่มที่ยังไม่มีคู่ครบ (ติดธงเตือนให้ตรวจชื่อ)
-#     และเทียบสินค้าแยกตามบริษัท (compare_po_do_by_company)
-#   ส่วนเครื่องมือวินิจฉัย (debug_*) ของโน้ตบุ๊กไม่ได้ย้ายมาในเว็บแอป
+#   ⚠️ จุดที่ต้องระวังตอนรวมไฟล์:
+#   - STEP 3 กับ STEP 5 มีตัวแปรชื่อ UNIT_PATTERN เหมือนกันแต่ regex คนละแบบ
+#     ฝั่ง STEP 5 จึงเปลี่ยนชื่อเป็น WEIGHT_UNIT_PATTERN (logic เดิมทุกจุด)
+#   - threshold ของ match_companies / build_company_compare_table เปลี่ยน default
+#     เป็น None แล้วอ่านค่าจาก SIMILARITY_THRESHOLD ตอนเรียกใช้ เพื่อให้ slider
+#     ในแถบด้านข้างมีผลจริง (ถ้าใช้ default เดิม ค่าจะถูกล็อกตอนโหลดไฟล์)
 # ==================================================================
 
-import os
 import re
-from io import BytesIO
+import contextlib
+from io import BytesIO, StringIO
 from collections import Counter
 from difflib import SequenceMatcher
 
@@ -47,7 +47,7 @@ def _get_app_password():
 
 
 def check_password():
-    """แสดงช่องกรอกรหัสผ่าน คืน True ถ้ารหัสถูกต้องแล้ว"""
+    """แสดงช่องกรอกรหัสผ่าน คืน True ถ้ารหัสผ่านถูกต้องแล้ว"""
     def password_entered():
         if st.session_state["password_input"] == _get_app_password():
             st.session_state["password_correct"] = True
@@ -65,7 +65,7 @@ def check_password():
 
 
 # ==================================================================
-# ============ STEP 3: อ่านไฟล์ PO (Inventory Issue) — รอบ 33 ============
+# ============ STEP 3: อ่านไฟล์ PO (Inventory Issue) — รอบ 34 ============
 # ==================================================================
 
 # ---------------------- Patterns พื้นฐาน ----------------------
@@ -79,6 +79,13 @@ PURE_NUMERIC_PATTERN = re.compile(r"^[\d,]+(\.\d+)?$")
 THAI_CHAR_PATTERN = re.compile(r"[\u0E00-\u0E7F]")
 # คำที่เป็นเครื่องหมายตกแต่งล้วน เช่น *** หรือ ===
 SYMBOL_ONLY_PATTERN = re.compile(r"^[*#=~_]+$")
+# [รอบ 34] เลขลำดับในคอลัมน์ No. (1-3 หลัก)
+NO_MARKER_PATTERN = re.compile(r"^\d{1,3}$")
+# [รอบ 34] รหัสนำหน้าชื่อสินค้าที่ต้องตัดออก (เพิ่มรหัสใหม่ได้ที่นี่)
+DESC_PREFIX_CODES = ["MCC-02", "MCC-04", "MCC-07", "BZn-21"]
+DESC_PREFIX_PATTERN = re.compile(
+    r"^(?:" + "|".join(re.escape(c) for c in DESC_PREFIX_CODES) + r")\s+",
+    re.IGNORECASE)
 
 # ค่าพิเศษ: แถวนี้อยู่นอกเส้นตาราง (เช่น แถวสรุปท้ายหน้า) -> ข้ามเฉพาะแถวนั้น
 OUT_OF_GRID = "OUT_OF_GRID"
@@ -103,7 +110,7 @@ COMPANY_COLUMNS = {"customer", "delivery place"}
 DESCRIPTION_COLUMNS = {"description"}
 
 
-# ---------- ส่วนที่ 1: Preprocessing ----------
+# ---------------- Preprocessing ----------------
 
 def merge_kerned_numbers(words, top_tolerance=1.0):
     """รวมคำที่เป็นตัวเลขล้วนติดกันด้วยช่องว่างเล็กมาก (kerning) ให้เป็นคำเดียว
@@ -195,7 +202,7 @@ def group_rows_into_blocks(rows, gap_threshold=BLOCK_GAP_THRESHOLD):
     return blocks
 
 
-# ---------- ส่วนที่ 2: หาเส้นแบ่งคอลัมน์ ----------
+# ---------------- หาเส้นแบ่งคอลัมน์ ----------------
 
 def get_vertical_line_xs(page, min_count=4, min_length=5):
     """ดึงตำแหน่ง x ของเส้นแนวตั้งจริงในหน้า คืน list ว่างถ้าหาไม่เจอเพียงพอ"""
@@ -300,7 +307,7 @@ def get_lot_column_left_x(page, rows, search_margin=8):
     return cands[0] if cands else None
 
 
-# ---------- ส่วนที่ 3: ตรวจจับ Lot + Quantity + Unit ----------
+# ---------------- ตรวจจับ Lot + Quantity + Unit ----------------
 
 def find_lot_qty_unit(row_words):
     n = len(row_words)
@@ -416,7 +423,7 @@ def split_company_description(candidates, boundaries=None, desc_col_x=None, tole
         return company_words, desc_words
 
 
-# ---------- ส่วนที่ 4: แยกรายการทั้งหมดในแถว/บล็อก (เส้นทางบล็อก) ----------
+# ---------------- แยกรายการในแถว/บล็อก (เส้นทางบล็อก) ----------------
 
 def parse_row_by_position(row_words, prev_description=None, prev_company=None,
                            boundaries=None, desc_col_x=None, lot_left_x=None):
@@ -581,9 +588,7 @@ def count_block_invoices(block_rows, boundaries):
 
 
 def collect_block_company_text(block_rows, boundaries):
-    """รวมข้อความคอลัมน์ company (เฉพาะ customer/delivery place ที่ไม่ถูก
-    เปลี่ยนเป็น location) ทุกบรรทัดในบล็อก เรียงบนลงล่าง
-    แทนระบบ 'ตัวสุดท้ายชนะ' ที่ทำให้ชื่อถูกบรรทัดล่างทับ"""
+    """รวมข้อความคอลัมน์ company ทุกบรรทัดในบล็อก เรียงบนลงล่าง"""
     cols = {}
     for row in block_rows:
         for w in row:
@@ -598,11 +603,67 @@ def collect_block_company_text(block_rows, boundaries):
     return " ".join(parts).strip()
 
 
-# ---------- ส่วนที่ 4.5: อ่านตามเซลล์ตารางจริง (cell-based) ----------
+# ---------------- [รอบ 34] แบ่งกลุ่มบริษัทตามเลขลำดับในคอลัมน์ No. ----------------
+
+def no_marker_ys(rows, boundaries):
+    """y ของเลขลำดับในคอลัมน์ 'no.' (ใช้เป็นตัวแบ่งกลุ่มลูกค้า)
+    คืน [] ถ้าไม่มีคอลัมน์ no. หรือไม่เจอเลข"""
+    rng = next(((l, r) for lab, l, r in (boundaries or []) if lab == "no."), None)
+    if rng is None:
+        return []
+    ys = []
+    for row in rows:
+        for w in row:
+            if rng[0] <= (w["x0"] + w["x1"]) / 2 < rng[1] and NO_MARKER_PATTERN.match(w["text"]):
+                ys.append((w["top"] + w["bottom"]) / 2)
+    return sorted(ys)
+
+
+def group_index(marker_ys, y, tol=4.0):
+    """y นี้อยู่กลุ่มที่เท่าไร (เลข No. ล่าสุดที่อยู่เหนือหรือระดับเดียวกัน)"""
+    idx = [i for i, m in enumerate(marker_ys) if m - tol <= y]
+    return idx[-1] if idx else 0
+
+
+def company_texts_by_no(rows, boundaries, marker_ys, tol=4.0):
+    """ข้อความบริษัทของแต่ละกลุ่ม No. คืน None ถ้าไม่เข้าเงื่อนไขปลอดภัย:
+    ทุกกลุ่มต้องมีข้อความบริษัทของตัวเอง และต้องมีอย่างน้อย 2 ข้อความที่ต่างกัน"""
+    if len(marker_ys) < 2:
+        return None
+    comp_ranges = [(l, r) for lab, l, r in boundaries if lab in COMPANY_COLUMNS]
+    if not comp_ranges:
+        return None
+    groups = [[] for _ in marker_ys]
+    for row in rows:
+        for w in row:
+            if is_noise_token(w["text"]):
+                continue
+            if any(l <= w["x0"] < r for l, r in comp_ranges):
+                cy = (w["top"] + w["bottom"]) / 2
+                groups[group_index(marker_ys, cy, tol)].append(w)
+    texts = []
+    for g in groups:
+        g.sort(key=lambda w: (round(w["top"]), w["x0"]))
+        texts.append(" ".join(w["text"] for w in g).strip())
+    if any(not t for t in texts) or len(set(texts)) < 2:
+        return None
+    return texts
+
+
+def company_cell_spans_markers(readers, y, marker_ys):
+    """เซลล์บริษัทที่ครอบแถวนี้ ครอบเลข No. ตั้งแต่ 2 ตัวขึ้นไปไหม"""
+    for label, (l, r, ys) in readers.items():
+        if label in COMPANY_COLUMNS:
+            iv = cell_interval(ys, y)
+            if iv and sum(1 for m in marker_ys if iv[0] < m < iv[1]) >= 2:
+                return True
+    return False
+
+
+# ---------------- อ่านตามเซลล์ตารางจริง (cell-based) ----------------
 
 def _segmented_hline_ys(page, left, right, min_cover=0.6, min_segments=4):
-    """เส้นประ/เส้นจุดที่ถูกวาดเป็นชิ้นเล็กๆ หลายชิ้น (rect/line/curve สูง <= 2)
-    pdfplumber ไม่รวมเป็นเส้นเดียว -> horizontal_edges มองไม่เห็น ต้องรวมเองตามระดับ y"""
+    """เส้นประ/เส้นจุดที่ถูกวาดเป็นชิ้นเล็กๆ หลายชิ้น รวมตามระดับ y"""
     right = min(right, page.width)
     width = max(right - left, 1)
     buckets = {}
@@ -644,8 +705,7 @@ def horizontal_edge_ys(page, left, right, min_cover=0.6):
 
 
 def inner_seps(seps, item_ys):
-    """เก็บเฉพาะเส้นที่มีรายการสินค้าอยู่ทั้งเหนือและใต้เส้น (เส้นคั่นภายในเนื้อตารางจริง)
-    เส้นหัวตาราง/เส้นขอบล่างที่มีรายการอยู่ด้านเดียวจะถูกทิ้ง"""
+    """เก็บเฉพาะเส้นที่มีรายการสินค้าอยู่ทั้งเหนือและใต้เส้น (เส้นคั่นภายในเนื้อตารางจริง)"""
     return [y for y in seps
             if any(i < y for i in item_ys) and any(i > y for i in item_ys)]
 
@@ -660,8 +720,7 @@ def cell_interval(edge_ys, y):
 def read_cell(all_words, left, right, interval, y=None, item_ys=None, tol=1.5):
     """รวมข้อความทุกคำที่จุดกึ่งกลางอยู่ในเซลล์ (ตัดภาษาไทย/*** ทิ้ง)
     ถ้าเซลล์เดียวครอบหลายรายการ และ "ทุกรายการมีบรรทัดข้อความของตัวเองอยู่ระดับเดียวกัน"
-    (ตารางที่ไม่มีเส้นคั่นแถว: แต่ละแถวมี description คนละบรรทัด) -> คืนเฉพาะบรรทัดของแถวนี้
-    ถ้าไม่ใช่ (เช่น merged cell ที่ข้อความบรรทัดเดียวอยู่กลางหลายแถว) -> คืนข้อความทั้งเซลล์เหมือนเดิม"""
+    -> คืนเฉพาะบรรทัดของแถวนี้ ไม่งั้นคืนข้อความทั้งเซลล์"""
     top, bottom = interval
     ws = [w for w in all_words
           if left <= (w["x0"] + w["x1"]) / 2 < right
@@ -684,14 +743,14 @@ def read_cell(all_words, left, right, interval, y=None, item_ys=None, tol=1.5):
     items_in = sorted(iy for iy in item_ys if top < iy < bottom)
     if len(items_in) < 2 or len(lines) < len(items_in):
         return whole
-    # ทุกรายการต้องมีบรรทัดที่อยู่ระดับเดียวกัน (ไม่งั้นถือว่าเป็นข้อความกลางเซลล์ merged)
+    # ทุกรายการต้องมีบรรทัดที่อยู่ระดับเดียวกัน
     aligned = []
     for iy in items_in:
         k = min(range(len(lines)), key=lambda i: abs(lines[i][0] - iy))
         if abs(lines[k][0] - iy) > tol or k in aligned:
             return whole
         aligned.append(k)
-    # บรรทัดที่ไม่ตรงกับรายการใด (เช่น บรรทัดที่สองของข้อความที่ตัดคำ) -> ต่อท้ายรายการที่อยู่เหนือมัน
+    # บรรทัดที่ไม่ตรงกับรายการใด -> ต่อท้ายรายการที่อยู่เหนือมัน
     owner = {}
     for n_, k in enumerate(aligned):
         owner[k] = n_
@@ -718,8 +777,7 @@ def build_cell_readers(page, boundaries):
 
 
 def can_use_cells(boundaries, readers):
-    """เงื่อนไขใช้ cell-based: มีคอลัมน์ company + description
-    (ถ้าบางแถวหาเซลล์ไม่ได้ จะถอยกลับเส้นทางบล็อกทั้งหน้าใน extract_items_from_page)"""
+    """เงื่อนไขใช้ cell-based: มีคอลัมน์ company + description และทุกคอลัมน์มีเส้นแนวนอน >= 2 เส้น"""
     return (boundaries is not None
             and any(k in readers for k in DESCRIPTION_COLUMNS)
             and any(k in readers for k in COMPANY_COLUMNS)
@@ -743,7 +801,8 @@ def cell_text(readers, all_words, y, labels, item_ys=None):
 
 def parse_row_cell_based(row_words, boundaries, readers, all_words, item_ys=None):
     """คืน list ของรายการ ([] = แถวนี้ไม่ใช่รายการ เช่น แถวหมายเหตุ)
-    หรือ None ถ้าแถวนี้ไม่เหมาะกับวิธีนี้ (ให้ผู้เรียกถอยไปใช้ logic บล็อก)"""
+    หรือ None ถ้าแถวนี้ไม่เหมาะกับวิธีนี้ (ให้ผู้เรียกถอยไปใช้ logic บล็อก)
+    หรือ OUT_OF_GRID ถ้าแถวอยู่นอกเส้นตาราง"""
     idxs = find_lot_qty_unit(row_words)
     if not idxs:
         return []
@@ -776,7 +835,7 @@ def parse_row_cell_based(row_words, boundaries, readers, all_words, item_ys=None
     }]
 
 
-# ---------- ส่วนที่ 5: ประมวลผลทั้งไฟล์ ----------
+# ---------------- ประมวลผลทั้งไฟล์ ----------------
 
 def row_center_y(row_words):
     """ตำแหน่ง y กึ่งกลางของแถว"""
@@ -787,12 +846,10 @@ def assign_by_centering(items, anchors, field, seps=None):
     """เติม field (company_info/description) ให้รายการที่ว่าง ในเส้นทางบล็อก
     โดยอาศัยว่าข้อความใน merged cell อยู่ "กึ่งกลางแนวตั้ง" ของกลุ่มแถวที่มันครอบ
     items  : รายการในบล็อกเรียงตามลำดับ แต่ละตัวมี "_y"
-    anchors: [(y, text)] ข้อความจริงที่เจอ (ของรายการเอง + แถวที่ไม่มี lot/qty/unit)
-    รายการที่อยู่ระหว่าง anchor สองตัว จะถูกแบ่งให้ anchor ที่ทำให้ข้อความอยู่กลางกลุ่มมากที่สุด
-    ถ้าเท่ากันให้ตกที่ anchor ก่อนหน้า (เหมือนพฤติกรรมเดิม = ข้อความอยู่บนสุดของเซลล์)
-    seps = y ของเส้นคั่นแนวนอนในคอลัมน์นี้ (รวมเส้นประ/จุด) ใช้แบ่ง "เซลล์":
+    anchors: [(y, text)] ข้อความจริงที่เจอ
+    seps = y ของเส้นคั่นแนวนอนในคอลัมน์นี้ ใช้แบ่ง "เซลล์":
       - เซลล์ของรายการมีข้อความอยู่ -> ใช้ข้อความในเซลล์เดียวกันเท่านั้น (ใกล้สุด)
-      - เซลล์ของรายการว่าง -> ช่องว่าง = เหมือนแถว "บน" (ditto) ห้ามดึงจากแถวล่าง
+      - เซลล์ของรายการว่าง -> เหมือนแถว "บน" (ditto) ห้ามดึงจากแถวล่าง
       ไม่มีเส้นคั่นเลย -> ใช้การจัดกลางแบบเดิม (merged cell ไม่มีเส้นแบ่ง)"""
     if not anchors:
         return
@@ -874,14 +931,25 @@ def _cell_path_items(rows, boundaries, readers, lot_left_x):
     """เส้นทาง cell-based คืน list รายการทั้งหมด (ยังไม่กรองแถวที่ description ว่าง)"""
     all_words = [w for r in rows for w in r]
     item_ys = row_item_ys(rows)
+    # [รอบ 34] กลุ่มลูกค้าตามเลข No. (None = ไม่เข้าเงื่อนไข -> ทำงานเหมือนเดิม)
+    marker_ys = no_marker_ys(rows, boundaries)
+    group_texts = company_texts_by_no(rows, boundaries, marker_ys)
     out = []
     for row_words in rows:
         res = parse_row_cell_based(row_words, boundaries, readers, all_words, item_ys)
         if isinstance(res, str):          # OUT_OF_GRID: นอกเส้นตาราง -> ข้ามเฉพาะแถวนี้
+            txt = " ".join(w["text"] for w in row_words)
+            print(f"   ⚠️ ข้ามแถวที่อยู่นอกเส้นตาราง: {txt[:80]}")
             continue
         if res is None:                   # แถวที่ cell-based ทำไม่ได้ (เช่น หลายชุดในแถวเดียว)
             res = parse_row_by_position(row_words, boundaries=boundaries,
                                         lot_left_x=lot_left_x)
+        elif res and group_texts:
+            # [รอบ 34] เซลล์บริษัทครอบเลข No. >= 2 ตัว (ไม่มีเส้นคั่นกลุ่ม) -> ใช้ชื่อตามกลุ่ม
+            y = row_center_y(row_words)
+            if company_cell_spans_markers(readers, y, marker_ys):
+                for it in res:
+                    it["company_info"] = group_texts[group_index(marker_ys, y)]
         out.extend(res)
     return out
 
@@ -897,8 +965,7 @@ def _block_path_items(rows, boundaries, desc_col_x, lot_left_x, seps_by_field=No
 
         for row_words in block_rows:
             y = row_center_y(row_words)
-            # ไม่ backfill ทีละแถว (ทำให้ข้อความกลางเซลล์ merged ไหลผิดทิศ)
-            # รายการที่ว่างจะถูกเติมทีหลังด้วย assign_by_centering
+            # ไม่ backfill ทีละแถว รายการที่ว่างจะถูกเติมทีหลังด้วย assign_by_centering
             row_items = parse_row_by_position(
                 row_words, boundaries=boundaries, desc_col_x=desc_col_x, lot_left_x=lot_left_x)
             if row_items:
@@ -930,10 +997,17 @@ def _block_path_items(rows, boundaries, desc_col_x, lot_left_x, seps_by_field=No
         has_inner_sep = any(blk_top < y < blk_bot for y in comp_seps)
         if boundaries is not None and block_items and not has_inner_sep \
                 and count_block_invoices(block_rows, boundaries) <= 1:
-            joined_company = collect_block_company_text(block_rows, boundaries)
-            if joined_company:
+            # [รอบ 34] ถ้าคอลัมน์ No. แบ่งกลุ่มชัดเจน (หลายกลุ่ม ชื่อต่างกัน) ใช้ข้อความตามกลุ่ม
+            marker_ys = no_marker_ys(block_rows, boundaries)
+            group_texts = company_texts_by_no(block_rows, boundaries, marker_ys)
+            if group_texts:
                 for it in block_items:
-                    it["company_info"] = joined_company
+                    it["company_info"] = group_texts[group_index(marker_ys, it["_y"])]
+            else:
+                joined_company = collect_block_company_text(block_rows, boundaries)
+                if joined_company:
+                    for it in block_items:
+                        it["company_info"] = joined_company
 
         for it in block_items:
             it.pop("_y", None)
@@ -946,7 +1020,7 @@ HEADER_WORDS_AS_COMPANY = {"delivery place", "customer", "location", "descriptio
 
 
 def _has_repeat(text, min_n=3):
-    """มีกลุ่มคำเดียวกันซ้ำติดกัน เช่น 'A B C A B C' (สัญญาณว่าอ่านทั้งเซลล์ซ้ำทุกแถว)"""
+    """มีกลุ่มคำเดียวกันซ้ำติดกัน เช่น 'A B C A B C'"""
     w = text.split()
     for n in range(min_n, len(w) // 2 + 1):
         for i in range(len(w) - 2 * n + 1):
@@ -983,10 +1057,7 @@ MERGED_COMPANY_WEIGHT = 5
 
 def merged_company_penalty(cell_items, block_items):
     """จับกรณีเส้นทางเซลล์อ่านคอลัมน์บริษัทเป็นเซลล์เดียวครอบทั้งตาราง
-    (คอลัมน์ไม่มีเส้นคั่นระหว่างบริษัท) จนชื่อหลายบริษัทถูกต่อกันให้ทุกแถว
-    หลักการ: ชื่อบริษัทที่แตกต่างกันจริงๆ (ตามที่เส้นทางบล็อกอ่านได้ ตัดชื่อที่เป็นส่วนหนึ่งของ
-    อีกชื่อออก) ถ้ารายการหนึ่งของเส้นทางเซลล์ "มีตั้งแต่ 2 ชื่อขึ้นไปปนอยู่" = อ่านผิด
-    ไฟล์ที่มีบริษัทเดียว/เส้นทางเซลล์อ่านแยกบริษัทได้ถูก -> คืน 0 (ไม่กระทบ)"""
+    จนชื่อหลายบริษัทถูกต่อกันให้ทุกแถว ไฟล์ที่ปกติ -> คืน 0 (ไม่กระทบ)"""
     norm = lambda x: re.sub(r"\s+", "", str(x)).lower()
     names = {norm(i["company_info"]) for i in block_items if norm(i["company_info"])}
     names = [n for n in names if not any(n != m and n in m for m in names)]
@@ -1002,28 +1073,40 @@ def merged_company_penalty(cell_items, block_items):
 
 def choose_path(cell_items, block_items, page_no):
     """เทียบผลสองเส้นทาง ถ้าตรงกันใช้เลย ถ้าไม่ตรงเลือกอันที่น่าสงสัยน้อยกว่า
-    (เท่ากัน -> เส้นทางเซลล์)"""
+    (เท่ากัน -> เส้นทางเซลล์) พร้อมพิมพ์รายการที่ต่างกันให้ตรวจ"""
     kc = [_item_key(i) for i in cell_items]
     kb = [_item_key(i) for i in block_items]
     if kc == kb:
         return cell_items
     sc, sb = suspicion_score(cell_items), suspicion_score(block_items)
-    # เส้นทางเซลล์ต่อชื่อหลายบริษัทเข้าด้วยกัน -> ปรับคะแนนหนัก
-    sc += merged_company_penalty(cell_items, block_items)
-    # จำนวนรายการต่างกัน -> เลือกเส้นทางที่ได้แถวมากกว่าเสมอ (แถวที่มี lot/qty/unit
-    # ครบคือข้อมูลจริง ห้ามหายแม้อีกเส้นทางจะดูน่าสงสัยน้อยกว่า)
+    pen = merged_company_penalty(cell_items, block_items)
+    sc += pen
+    # จำนวนรายการต่างกัน -> เลือกเส้นทางที่ได้แถวมากกว่าเสมอ
     if len(cell_items) != len(block_items):
         use_cell = len(cell_items) > len(block_items)
     else:
         use_cell = sc <= sb
-    return cell_items if use_cell else block_items
+    if use_cell:
+        chosen, name = cell_items, "เซลล์"
+    else:
+        chosen, name = block_items, "บล็อก"
+    diffs = [(a, b) for a, b in zip(cell_items, block_items) if _item_key(a) != _item_key(b)]
+    print(f"   ⚠️ หน้า {page_no}: เส้นทางเซลล์กับบล็อกได้ผลไม่ตรงกัน "
+          f"(เซลล์ {len(cell_items)} รายการ/น่าสงสัย {sc} | บล็อก {len(block_items)} รายการ/น่าสงสัย {sb}) "
+          f"-> ใช้ผลของ{name}")
+    if pen:
+        print("      (เส้นทางเซลล์ถูกปรับคะแนน: ชื่อหลายบริษัทถูกต่อกันในรายการเดียว)")
+    for a, b in diffs[:3]:
+        print(f"      เซลล์ : {a['company_info']!r} | {a['description'][:40]!r} | {a['quantity']}")
+        print(f"      บล็อก : {b['company_info']!r} | {b['description'][:40]!r} | {b['quantity']}")
+    if len(cell_items) != len(block_items):
+        print(f"      จำนวนรายการต่างกัน: เซลล์ {len(cell_items)} vs บล็อก {len(block_items)}")
+    return chosen
 
 
 def fill_blank_from_previous(items, last=None):
     """ช่อง description/company ว่างในแถวที่เป็นรายการจริง (มี Lot)
     = เหมือนแถวบน (ditto) ใช้ต่อเนื่องข้ามบล็อกและข้ามหน้า
-    items: รายการเรียงตามลำดับในหน้า
-    last : {"description", "company_info"} ล่าสุดจากหน้าก่อน (None = เริ่มต้น)
     คืน (items, last ใหม่) -- ไม่แก้ค่า last เดิมที่ส่งเข้ามา"""
     last = dict(last or {"description": "", "company_info": ""})
     for it in items:
@@ -1037,6 +1120,19 @@ def fill_blank_from_previous(items, last=None):
         if it["company_info"]:
             last["company_info"] = it["company_info"]
     return items, last
+
+
+def strip_description_prefix(items):
+    """[รอบ 34] ตัดรหัสนำหน้า (MCC-02/MCC-04/MCC-07/BZn-21) ออกจากชื่อสินค้า
+    ตัดเฉพาะตอนรหัสอยู่ต้นชื่อและตามด้วยช่องว่าง และยังเหลือชื่ออยู่"""
+    for it in items:
+        d = str(it["description"])
+        m = DESC_PREFIX_PATTERN.match(d.strip())
+        if m:
+            rest = d.strip()[m.end():].strip()
+            if rest:
+                it["description"] = rest
+    return items
 
 
 def extract_items_from_page(page, inherited_boundaries=None, carry=None):
@@ -1092,6 +1188,12 @@ def extract_items_from_page(page, inherited_boundaries=None, carry=None):
     # เติมซ้ำหลังเลือกเส้นทาง และได้ carry สำหรับหน้าถัดไป
     final, new_carry = fill_blank_from_previous(final, carry)
 
+    # [รอบ 34] ตัดรหัสนำหน้าชื่อสินค้าเป็นขั้นสุดท้าย (หลังเทียบสองเส้นทางและเติม ditto แล้ว)
+    # carry ตัดด้วยเพื่อให้ ditto ข้ามหน้าได้ชื่อเดียวกัน
+    final = strip_description_prefix(final)
+    carry_items = strip_description_prefix([dict(new_carry)])
+    new_carry = carry_items[0]
+
     return [it for it in final if it["description"]], boundaries, new_carry
 
 
@@ -1109,8 +1211,7 @@ def extract_items_by_position(pdf):
 
 
 def sanity_check_df(items_df):
-    """[ปรับจาก sanity_check เดิม] คืน DataFrame ของแถวที่ดูผิดปกติ แทนการ
-    print/display ตรงๆ (เดิมใช้ใน Colab) เพื่อให้ UI เว็บเอาไปแสดงเองได้"""
+    """คืน DataFrame ของแถวที่ดูผิดปกติ (ให้ UI เว็บเอาไปแสดงเอง)"""
     suspicious = items_df[
         (items_df["description"].astype(str).str.strip() == "")
         | (items_df["company_info"].astype(str).str.strip() == "")
@@ -1123,11 +1224,8 @@ def sanity_check_df(items_df):
     return suspicious
 
 
-# ---------- ส่วนที่ 6: สรุปยอดรวมต่อบริษัท ----------
-
 def summarize_company_totals(items_df, group_by_file=True):
-    """สรุปน้ำหนัก/จำนวนรวม (sum ของคอลัมน์ quantity) ต่อบริษัทแต่ละราย
-    รวมทุก uom เข้าด้วยกันตรงๆ (ไม่แปลงหน่วย)"""
+    """สรุปน้ำหนัก/จำนวนรวมต่อบริษัท รวมทุก uom เข้าด้วยกันตรงๆ (ไม่แปลงหน่วย)"""
     df = items_df[items_df["company_info"].astype(str).str.strip() != ""].copy()
     group_cols = ["source_file", "company_info"] if group_by_file else ["company_info"]
     summary = (
@@ -1141,8 +1239,9 @@ def summarize_company_totals(items_df, group_by_file=True):
 
 
 def process_po_uploads(uploaded_files):
-    """[ใหม่ แทน read_inventory_issue] อ่านไฟล์ PO จากไฟล์ที่อัปโหลดผ่านเว็บ
-    แทนการอ่านจากโฟลเดอร์บนดิสก์ — logic การแกะ PDF ข้างในเหมือนเดิมทุกจุด"""
+    """อ่านไฟล์ PO จากไฟล์ที่อัปโหลดผ่านเว็บ (แทนการอ่านจากโฟลเดอร์)
+    ข้อความที่ logic ข้างใน print ออกมา (เช่น เตือนเส้นทางเซลล์/บล็อกไม่ตรงกัน)
+    จะถูกเก็บเข้า logs เพื่อแสดงในช่อง 'บันทึกการอ่านไฟล์'"""
     all_items_dfs = []
     failed_files = []
     logs = []
@@ -1150,14 +1249,18 @@ def process_po_uploads(uploaded_files):
     for uploaded_file in uploaded_files:
         filename = uploaded_file.name
         logs.append(f"📄 กำลังอ่าน PO: {filename}")
+        buf = StringIO()
         try:
             uploaded_file.seek(0)
-            with pdfplumber.open(uploaded_file) as pdf:
-                items = extract_items_by_position(pdf)
+            with contextlib.redirect_stdout(buf):
+                with pdfplumber.open(uploaded_file) as pdf:
+                    items = extract_items_by_position(pdf)
         except Exception as e:
+            logs.extend(l for l in buf.getvalue().splitlines() if l.strip())
             logs.append(f"   ❌ อ่านไฟล์ไม่สำเร็จ: {e}")
             failed_files.append(filename)
             continue
+        logs.extend(l for l in buf.getvalue().splitlines() if l.strip())
 
         if not items:
             logs.append("   ⚠️ อ่านได้แต่ไม่มีรายการสินค้าเลย ข้ามไป")
@@ -1185,11 +1288,10 @@ def process_po_uploads(uploaded_files):
 
 
 # ==================================================================
-# ============ STEP 4: อ่านไฟล์ DO ============
+# ============ STEP 4: อ่านไฟล์ DO (เดิม ไม่เปลี่ยน) ============
 # ==================================================================
 
 def split_total(total_str):
-    """แยก '400.000 KG' -> (400.0, 'KG'); ถ้าไม่มีหน่วยต่อท้าย default เป็น 'KG'"""
     if not total_str or str(total_str).strip() == "":
         return None, None
     m = re.match(r"([\d,]+(?:\.\d+)?)\s*([A-Za-z]*)", str(total_str).strip())
@@ -1201,7 +1303,6 @@ def split_total(total_str):
 
 
 def extract_do_items(page):
-    """ดึงรายการสินค้าจากตาราง DO 1 หน้า — สนใจแค่ lot_number, description, total"""
     items = []
     for table in page.extract_tables():
         if not table:
@@ -1232,7 +1333,6 @@ def extract_do_items(page):
 
 
 def extract_do_ref(pdf):
-    """หาเลขอ้างอิงเอกสาร DO (รูปแบบ TSADOxxxxxxxxx) จากทุกหน้า ใช้บอกว่าต้องแก้ DO ไฟล์ไหน"""
     for page in pdf.pages:
         text = page.extract_text(use_text_flow=True) or ""
         m = re.search(r"(TSADO\d+)", text)
@@ -1242,7 +1342,6 @@ def extract_do_ref(pdf):
 
 
 def extract_customer_name(pdf):
-    """หาชื่อบริษัทจากบรรทัด 'Customer Name :' ในเอกสาร DO"""
     for page in pdf.pages:
         text = page.extract_text() or ""
         m = re.search(r"Customer Name\s*:\s*(.+)", text)
@@ -1254,7 +1353,6 @@ def extract_customer_name(pdf):
 
 
 def do_records_to_df(do_records):
-    """รวม items จากทุกไฟล์ DO เป็น DataFrame เดียว (มี do_ref + customer_name ติดมาด้วย)"""
     all_items = []
     for do in do_records:
         all_items.extend(do["items"])
@@ -1264,8 +1362,6 @@ def do_records_to_df(do_records):
 
 
 def summarize_do_totals(do_items_df, group_by_do_ref=True):
-    """สรุปน้ำหนักรวมต่อบริษัท จากข้อมูล DO — คอลัมน์เอาต์พุตหน้าตาเหมือน
-    summarize_company_totals ของ STEP 3 (company_info, total_quantity)"""
     empty_cols = (["do_ref", "company_info"] if group_by_do_ref else ["company_info"]) + ["total_quantity"]
     if "customer_name" not in do_items_df.columns or do_items_df.empty:
         return pd.DataFrame(columns=empty_cols)
@@ -1283,8 +1379,7 @@ def summarize_do_totals(do_items_df, group_by_do_ref=True):
 
 
 def process_do_uploads(uploaded_files):
-    """[ใหม่ แทน read_do_files] อ่านไฟล์ DO จากไฟล์ที่อัปโหลดผ่านเว็บแทนการ
-    อ่านจากโฟลเดอร์บนดิสก์ — logic การแกะ PDF ข้างในเหมือนเดิมทุกจุด"""
+    """อ่านไฟล์ DO จากไฟล์ที่อัปโหลดผ่านเว็บ"""
     results = []
     logs = []
     for uploaded_file in uploaded_files:
@@ -1318,7 +1413,12 @@ def process_do_uploads(uploaded_files):
 
 
 # ==================================================================
-# ============ STEP 5: เปรียบเทียบ PO vs DO — รอบ 13 ============
+# ============ STEP 5: เปรียบเทียบ PO vs DO — รอบ 20 ============
+#   หลักการจับกลุ่มสินค้า: "ชื่อต้องตรงก่อน Lot ใช้ยืนยันเท่านั้น"
+#     ชัวร์     ชื่อฐานเท่ากันเป๊ะ (หรือชื่อสำรองในวงเล็บตรงกัน)   -> รวม
+#     อ่อน      Lot ตรงกัน + ชื่อไม่ขัดกัน -> รวม + ติดธง ⚠️
+#     ห้ามรวม   ชื่อต่างแบบแทนที่ตัวอักษร/ตัวเลข (S2 vs S3) -> ไม่รวม แม้ Lot ตรง
+#   เทียบแยกตามบริษัท: จับคู่บริษัท PO<->DO แล้วเรียก compare_po_do ทีละคู่
 # ==================================================================
 
 TOLERANCE = 0.01
@@ -1326,16 +1426,21 @@ SIMILARITY_THRESHOLD = 0.8
 COMPANY_WEAK_THRESHOLD = 0.4
 COMPANY_WEIGHT_TOLERANCE_RATIO = 0.05
 NAME_SOFT_RATIO = 0.8
+NEAR_NAME_RATIO = 0.7          # เกณฑ์ Hint "ชื่อใกล้เคียง" + จับคู่ PO-only <-> DO-only ตอนแสดงผล
 
-# [รอบ 13] เพิ่ม KGS, LTRS, LTR, LT  (เปลี่ยนชื่อจาก UNIT_PATTERN กันชนกับ STEP 3)
+# 'T' เดี่ยวท้ายชื่อที่ต่อจากวงเล็บ เช่น 'CPALL-200EX (20kg/ca) T' (ไม่ใช่ (T) = Trix)
+PACK_PAREN_PATTERN = re.compile(r"^\s*\d+(\.\d+)?\s*[A-Za-z]{1,4}\s*(/\s*[A-Za-z]{1,6})?\s*$")
+TRAILING_T_PATTERN = re.compile(r"\)\s+T\s*$", flags=re.IGNORECASE)
+
+# [เปลี่ยนชื่อจาก UNIT_PATTERN ของ STEP 5 กันชนกับ UNIT_PATTERN ของ STEP 3]
 WEIGHT_UNIT_PATTERN = re.compile(
     r"\b\d+(\.\d+)?\s*(KGS|KG|G|GRAMS?|LTRS|LTR|LT|LITERS|LITER|LITRES|LITRE|L|ML|TONS?|BAGS?|CANS?|DRUMS?|PACKS?|PCS?|SET|SETS)\b"
-    r"(\s*/\s*(CAN|CANS|BAG|BAGS|DRUM|DRUMS|PACK|PACKS|PCS?|SET|SETS|BOX|BOXES|BOTTLE|BOTTLES|PAIL|PAILS|TANK|TANKS)\b)?",
+    r"(\s*/\s*(CAN|CANS|BAG|BAGS|DRUM|DRUMS|PACK|PACKS|PCS?|SET|SETS|BOX|BOXES|BOTTLE|BOTTLES|PAIL|PAILS|TANK|TANKS|CTN|CTNS|CARTON|CARTONS)\b)?",
     flags=re.IGNORECASE,
 )
 
 
-# ---------- Trix ----------
+# ---------------- Trix ----------------
 def requires_trix(desc):
     return bool(re.search(r"\(\s*T\s*\)", desc or ""))
 
@@ -1351,35 +1456,158 @@ def is_trix_ok(desc):
     return is_trix_variant(desc) or requires_trix(desc)
 
 
-# ---------- Lot / ชื่อฐาน ----------
+# ---------------- Lot ----------------
+# Lot ที่เป็นวันที่: รองรับ 1/10/2026, 01-10-2026, 2026-10-01, 2026-10-01 00:00:00
+DATE_PATTERN = re.compile(
+    r"^\s*(\d{1,4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,4})"
+    r"(?:[ T]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)?\s*$"
+)
+
+
+def _date_key(s):
+    m = DATE_PATTERN.match(s)
+    if not m:
+        return None
+    a, b, c = m.groups()
+    if len(a) == 4 and len(c) <= 2:        # y-m-d
+        y, p, q = int(a), int(b), int(c)
+    elif len(c) == 4 and len(a) <= 2:      # d/m/y หรือ m/d/y
+        y, p, q = int(c), int(a), int(b)
+    elif len(c) == 2 and len(a) <= 2 and len(b) <= 2:   # d/m/yy เช่น 2/7/26 -> ปี 2026
+        y, p, q = 2000 + int(c), int(a), int(b)
+    else:
+        return None
+    if y > 2400:                           # ปี พ.ศ.
+        y -= 543
+    if not (1 <= p <= 31 and 1 <= q <= 31 and min(p, q) <= 12):
+        return None
+    # วัน/เดือนเรียงแบบไหนก็ได้ (กัน Excel สลับ d/m) -> ใช้ min,max
+    return f"D{y}-{min(p, q)}-{max(p, q)}"
+
+
 def lot_key(lot):
-    """'60318-00 (THS333/66)' -> '60318' ; '2171591' -> '2171591' (เทียบตรงตัว ไม่ใช้ prefix)"""
+    """รหัสหลักของ Lot หนึ่งค่า
+    - วันที่ -> 'D2026-1-10'
+    - ตัวแรกยาว >= 5 ใช้ตัวแรกเหมือนเดิม: '60318-00 (THS333/66)' -> '60318'
+    - ตัวแรกสั้น (< 5) ใช้ทั้งก้อนตัดสัญลักษณ์: '26-SAR-223' / '26SAR223' -> '26SAR223'"""
     s = str(lot or "").strip().upper()
+    d = _date_key(s)
+    if d:
+        return d
+    s = re.sub(r"\([^)]*\)", " ", s).strip()
     m = re.match(r"[A-Z0-9]+", s)
-    return m.group(0) if m else s
+    first = m.group(0) if m else ""
+    if len(first) >= 5:
+        return first
+    return re.sub(r"[^A-Z0-9]", "", s) or s
+
+
+def lot_keys(lot):
+    """ชุดรหัสของ Lot หนึ่งค่า: รหัสหลัก + รหัสในวงเล็บ (ตรงอันใดอันหนึ่งก็ถือว่าเป็น Lot เดียวกัน)
+    '260626A (THS035/26)' -> {'260626A', 'THS03526'}
+    'THS035/26'           -> {'THS035', 'THS03526'}"""
+    s = str(lot or "").strip().upper()
+    keys = set()
+    main = re.sub(r"\([^)]*\)", " ", s).strip()
+    d = _date_key(main)
+    if d:
+        keys.add(d)
+    else:
+        k = lot_key(main)
+        if k:
+            keys.add(k)
+        sq = re.sub(r"[^A-Z0-9]", "", main)
+        if len(sq) >= 4:
+            keys.add(sq)
+    for inner in re.findall(r"\(([^)]*)\)", s):
+        di = _date_key(inner.strip())
+        sqi = re.sub(r"[^A-Z0-9]", "", inner)
+        if di:
+            keys.add(di)
+        elif len(sqi) >= 5 and any(c.isdigit() for c in sqi):   # กันวงเล็บบรรจุภัณฑ์/หมายเหตุสั้นๆ
+            keys.add(sqi)
+    return keys
 
 
 def lots_compatible(lot_a, lot_b):
-    a, b = lot_key(lot_a), lot_key(lot_b)
-    return bool(a) and a == b
+    return bool(lot_keys(lot_a) & lot_keys(lot_b))
 
 
+def make_lot_canon(lots):
+    """รวม Lot ที่มีรหัสซ้ำกันเป็นกลุ่มเดียว
+    คืนฟังก์ชัน canon(lot) -> รหัสตัวแทน (ใช้แทน lot_key ตอน bucket / เช็ค Trix)"""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for lot in lots:
+        ks = sorted(lot_keys(lot))
+        for k in ks[1:]:
+            ra, rb = find(ks[0]), find(k)
+            if ra != rb:
+                parent[ra] = rb
+
+    def canon(lot):
+        ks = sorted(lot_keys(lot))
+        return find(ks[0]) if ks else ""
+
+    return canon
+
+
+# ---------------- ชื่อฐาน ----------------
 def base_name_key(desc):
     """ชื่อฐานแบบเข้ม: ตัดวงเล็บ (T)/บรรจุภัณฑ์, หน่วย, TRIX, สัญลักษณ์และช่องว่าง
-    'DIPSO -F (20KG/CAN)-TRIX' -> 'DIPSOF'
-    'XXX-PLUS (XXX) 20KG/CAN'  -> 'XXXPLUS'"""
+    'DIPSO -F (20KG/CAN)-TRIX' -> 'DIPSOF'"""
     s = str(desc or "")
+    s = TRAILING_T_PATTERN.sub(")", s)        # 'CPALL-200EX (20kg/ca) T' -> ตัด T เดี่ยวท้ายชื่อ
     s = re.sub(r"\([^)]*\)", " ", s)
     s = WEIGHT_UNIT_PATTERN.sub(" ", s)
     s = re.sub(r"[^A-Za-z0-9]", "", s).upper()
     return s.replace("TRIX", "")
 
 
+def name_segments(desc):
+    """แยกชื่อที่ถูกต่อกันหลายบรรทัด (DO บางใบพิมพ์ 2 ชื่อในช่องเดียว)
+    บรรทัดที่วงเล็บยังไม่ปิดจะถูกต่อกลับเป็นชื่อเดียว"""
+    lines = [l.strip() for l in re.split(r"[\r\n]+", str(desc or "")) if l.strip()]
+    segs, buf = [], ""
+    for l in lines:
+        buf = f"{buf} {l}".strip() if buf else l
+        if buf.count("(") <= buf.count(")"):
+            segs.append(buf)
+            buf = ""
+    if buf:
+        segs.append(buf)
+    # ชื่อต่อกันในบรรทัดเดียว: ตัดหลังวงเล็บปิดที่ตามด้วยคำใหม่ (ไม่ตัดถ้าตามด้วยวงเล็บ)
+    out = []
+    for sg in segs:
+        out.extend(x.strip() for x in re.split(r"(?<=\))\s+(?=[A-Za-z0-9])", sg) if x.strip())
+    return out
+
+
+def segment_name_keys(desc):
+    """ชื่อสำรองจากแต่ละบรรทัด (เฉพาะเมื่อมี >= 2 บรรทัด, key ยาว >= 6 และมีตัวอักษร >= 3)"""
+    out = set()
+    segs = name_segments(desc)
+    if len(segs) >= 2:
+        for sg in segs:
+            k = base_name_key(sg)
+            if len(k) >= 6 and sum(c.isalpha() for c in k) >= 3:
+                out.add(k)
+    return out if len(out) >= 2 else set()      # ต้องมีอย่างน้อย 2 ชื่อจริง
+
+
 def paren_name_keys(desc):
-    """ชื่อสำรองจากในวงเล็บ (ไม่นับวงเล็บบรรจุภัณฑ์/(T)/สั้นเกินไป)
-    'Dicalite Free-Can Diatomaceous Earth (DECALITE SPEEDPLUS)' -> {'DECALITESPEEDPLUS'}"""
+    """ชื่อสำรองจากในวงเล็บ (ไม่นับวงเล็บบรรจุภัณฑ์/(T)/สั้นเกินไป)"""
     out = set()
     for inner in re.findall(r"\(([^)]*)\)", str(desc or "")):
+        if PACK_PAREN_PATTERN.match(inner):        # '(18K/can)' = บรรจุภัณฑ์ ไม่ใช่ชื่อสำรอง
+            continue
         s = WEIGHT_UNIT_PATTERN.sub(" ", inner)
         k = re.sub(r"[^A-Za-z0-9]", "", s).upper().replace("TRIX", "")
         if len(k) >= 5 and sum(c.isalpha() for c in k) >= 4:
@@ -1388,10 +1616,8 @@ def paren_name_keys(desc):
 
 
 def acronym_keys(desc):
-    """[รอบ 13] ชื่อสำรองแบบตัวย่อ: ยุบ 3 คำแรก (ตัวอักษรล้วน คำละ >= 3 ตัว) เป็นตัวอักษรตัวแรก
-    แล้วต่อด้วยส่วนที่เหลือ  'Uion Tin Bright CC-1' -> 'UTBCC1'
-    ต้องมีส่วนท้ายต่อ (>= 4 token) และ key ยาว >= 5 กันชนมั่ว
-    'UTB' เดี่ยว ๆ หรือ 'UTB CC-1' ไม่ได้ชื่อสำรองเพิ่ม"""
+    """ชื่อสำรองแบบตัวย่อ: ยุบ 3 คำแรก (ตัวอักษรล้วน คำละ >= 3 ตัว) เป็นตัวอักษรตัวแรก
+    แล้วต่อด้วยส่วนที่เหลือ  'Uion Tin Bright CC-1' -> 'UTBCC1'"""
     s = re.sub(r"\([^)]*\)", " ", str(desc or ""))
     s = WEIGHT_UNIT_PATTERN.sub(" ", s)
     tokens = re.findall(r"[A-Za-z0-9]+", s.upper())
@@ -1408,7 +1634,7 @@ def acronym_keys(desc):
 
 def name_keys(desc):
     base = base_name_key(desc)
-    return ({base} if base else set()) | paren_name_keys(desc) | acronym_keys(desc)
+    return ({base} if base else set()) | paren_name_keys(desc) | acronym_keys(desc) | segment_name_keys(desc)
 
 
 def name_relation(ka, kb):
@@ -1418,7 +1644,7 @@ def name_relation(ka, kb):
     if ka == kb:
         return "same"
 
-    # [รอบ 11] ชื่อสั้นเป็นส่วนนำของชื่อยาว
+    # ชื่อสั้นเป็นส่วนนำของชื่อยาว
     shorter, longer = sorted([ka, kb], key=len)
     if len(shorter) >= 2 and longer.startswith(shorter):
         rest = longer[len(shorter):]
@@ -1447,10 +1673,8 @@ def name_relation(ka, kb):
 
 def name_relation_multi(ka, alts_a, kb, alts_b):
     """เทียบชื่อของสองฝั่ง โดยลองชื่อสำรองในวงเล็บด้วย
-    คู่ใดคู่หนึ่ง 'same'  -> same
-    ไม่มี same แต่มี soft  -> soft
-    ฝั่งใดฝั่งหนึ่งไม่มีชื่อเลย -> unknown
-    นอกนั้น                -> conflict"""
+    คู่ใดคู่หนึ่ง 'same' -> same | ไม่มี same แต่มี soft -> soft
+    ฝั่งใดฝั่งหนึ่งไม่มีชื่อเลย -> unknown | นอกนั้น -> conflict"""
     set_a = set(alts_a or ()) | ({ka} if ka else set())
     set_b = set(alts_b or ()) | ({kb} if kb else set())
     if not set_a or not set_b:
@@ -1467,12 +1691,57 @@ def name_relation_multi(ka, alts_a, kb, alts_b):
     return best
 
 
-# ---------- จัดกลุ่มสินค้า ----------
+# ---------------- เทียบชื่อรายคำ ----------------
+def name_tokens(desc):
+    s = TRAILING_T_PATTERN.sub(")", str(desc or ""))
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = WEIGHT_UNIT_PATTERN.sub(" ", s)
+    return [t for t in re.findall(r"[A-Za-z0-9]+", s.upper()) if t != "TRIX"]
+
+
+def token_soft(desc_a, desc_b):
+    """ชื่อต่างกัน 'คำเดียว' (ตัวอักษรล้วน >= 3 ตัว) นอกนั้นเหมือนกัน
+    'Stannous Tulfate K' vs 'TIN TULFATE K 20KG' -> True (soft)"""
+    ta, tb = name_tokens(desc_a), name_tokens(desc_b)
+    if len(ta) != len(tb) or len(ta) < 2:
+        return False
+    diff = [(x, y) for x, y in zip(ta, tb) if x != y]
+    if len(diff) != 1:
+        return False
+    x, y = diff[0]
+    if not (x.isalpha() and y.isalpha() and len(x) >= 3 and len(y) >= 3):
+        return False
+    shared = [x for x, y in zip(ta, tb) if x == y]
+    return any(t.isalpha() and len(t) >= 4 for t in shared)
+
+
+def token_truncated(desc_a, desc_b):
+    """ชื่อฝั่งหนึ่งถูกตัดท้ายกลางคำ: 'BLACK OXI' vs 'BLACK OXIDE'"""
+    ta, tb = name_tokens(desc_a), name_tokens(desc_b)
+    if len(ta) != len(tb) or len(ta) < 2:
+        return False
+    if ta[:-1] != tb[:-1]:
+        return False
+    x, y = sorted([ta[-1], tb[-1]], key=len)
+    return x.isalpha() and y.isalpha() and len(x) >= 3 and len(y) > len(x) and y.startswith(x)
+
+
+def name_hint(po_desc, do_desc):
+    """เหตุผลที่ชื่อไม่ตรงเป๊ะแต่ถูกจับคู่ (ข้อความอย่างเดียว ไม่กระทบการจับคู่)"""
+    if token_truncated(po_desc, do_desc):
+        return "ชื่อใน DO อาจถูกตัดท้าย"
+    if token_soft(po_desc, do_desc):
+        return "ชื่อต่างกัน 1 คำ"
+    return "สะกดต่างกันเล็กน้อย"
+
+
+# ---------------- จัดกลุ่มสินค้า ----------------
 def group_items_by_name(po, do):
     """รวม PO+DO items เป็นกลุ่มสินค้าเดียวกัน (Union-Find)
     รอบที่ 1: ชื่อเท่ากันเป๊ะ (ชื่อฐาน/ชื่อสำรองในวงเล็บ) -> รวม (ชัวร์)
     รอบที่ 2: Lot ตรงกัน และชื่อไม่ขัดกัน -> รวม + ติดธง weak
-              [รอบ 12] ข้ามถ้าทั้งสองกลุ่มมี PO+DO ครบแล้ว (Lot มีไว้ช่วยกลุ่มที่ยังหาคู่ไม่เจอเท่านั้น)
+              (ข้ามถ้าทั้งสองกลุ่มมี PO+DO ครบแล้ว)
+    รอบที่ 3: PO-only + DO-only ชื่อ soft และ Lot ไม่ขัดกัน (ว่างหรือตรง) -> รวม + weak
     ทุก union ต้องผ่าน can_merge (ไม่มีชื่อขัดกันข้ามสองกลุ่ม)"""
     items = []
     for _, row in po.iterrows():
@@ -1504,7 +1773,13 @@ def group_items_by_name(po, do):
     def rel(a, b):
         k = (a, b) if a < b else (b, a)
         if k not in rel_cache:
-            rel_cache[k] = name_relation_multi(keys[a], alts[a], keys[b], alts[b])
+            r = name_relation_multi(keys[a], alts[a], keys[b], alts[b])
+            # ชื่อต่างกันคำเดียว หรือถูกตัดท้ายกลางคำ -> ลดจาก conflict เป็น soft
+            # (soft อย่างเดียวไม่รวมกลุ่ม ยังต้องมี Lot ตรง/เข้ารอบ 3 และผ่าน can_merge)
+            if r == "conflict" and (token_soft(items[a]["description"], items[b]["description"])
+                                    or token_truncated(items[a]["description"], items[b]["description"])):
+                r = "soft"
+            rel_cache[k] = r
         return rel_cache[k]
 
     def can_merge(i, j):
@@ -1514,11 +1789,13 @@ def group_items_by_name(po, do):
         b_side = [k for k in range(n) if find(k) == rj]
         return not any(rel(a, b) == "conflict" for a in a_side for b in b_side)
 
-    def is_complete(i):
-        """[รอบ 12] กลุ่มของ i มีทั้ง PO และ DO แล้วหรือยัง"""
+    def src_set(i):
         r = find(i)
-        srcs = {items[k]["source"] for k in range(n) if find(k) == r}
-        return srcs == {"PO", "DO"}
+        return {items[k]["source"] for k in range(n) if find(k) == r}
+
+    def is_complete(i):
+        """กลุ่มของ i มีทั้ง PO และ DO แล้วหรือยัง"""
+        return src_set(i) == {"PO", "DO"}
 
     # รอบที่ 1: ชื่อเท่ากันเป๊ะ (ชัวร์)
     for i in range(n):
@@ -1535,11 +1812,34 @@ def group_items_by_name(po, do):
                 continue
             if rel(i, j) == "conflict":
                 continue
-            if is_complete(i) and is_complete(j):      # [รอบ 12] ชื่อจับคู่ครบแล้ว ไม่ต้องใช้ Lot ลากมารวม
+            if is_complete(i) and is_complete(j):      # ชื่อจับคู่ครบแล้ว ไม่ต้องใช้ Lot ลากมารวม
                 continue
             if lots_compatible(items[i]["lot_number"], items[j]["lot_number"]) and can_merge(i, j):
                 union(i, j)
                 items[i]["weak"] = items[j]["weak"] = True
+
+    # รอบที่ 3: PO-only กับ DO-only ที่ชื่อ soft และ Lot ไม่ขัดกัน (ว่างหรือมีรหัสซ้ำกัน)
+    for i in range(n):
+        if items[i]["source"] != "PO" or src_set(i) != {"PO"}:
+            continue
+        best = None
+        for j in range(n):
+            if items[j]["source"] != "DO" or find(i) == find(j) or src_set(j) != {"DO"}:
+                continue
+            if rel(i, j) != "soft":
+                continue
+            li, lj = lot_keys(items[i]["lot_number"]), lot_keys(items[j]["lot_number"])
+            if li and lj and not (li & lj):            # มี Lot ทั้งสองฝั่งแต่ไม่มีรหัสซ้ำเลย -> ไม่รวม
+                continue
+            if not can_merge(i, j):
+                continue
+            score = SequenceMatcher(None, keys[i], keys[j]).ratio()
+            if best is None or score > best[0]:
+                best = (score, j)
+        if best:
+            j = best[1]
+            union(i, j)
+            items[i]["weak"] = items[j]["weak"] = True
 
     groups = {}
     for i, it in enumerate(items):
@@ -1549,10 +1849,15 @@ def group_items_by_name(po, do):
 
 def lot_level_mismatch(po_items, do_items):
     """คืนรายการ Lot ที่มีปัญหา: PO ไม่มีคู่ใน DO / น้ำหนักรายล็อตไม่ตรง / DO มี Lot ที่ PO ไม่มี"""
+    canon = make_lot_canon([it["lot_number"] for it in po_items + do_items])
+    show = {}
+    for it in po_items + do_items:
+        show.setdefault(canon(it["lot_number"]), str(it["lot_number"] or ""))
+
     def bucket(items):
         b = {}
         for it in items:
-            k = lot_key(it["lot_number"])
+            k = canon(it["lot_number"])
             b[k] = b.get(k, 0) + it["quantity"]
         return b
 
@@ -1560,14 +1865,82 @@ def lot_level_mismatch(po_items, do_items):
     bad = []
     for k, q in pb.items():
         if k not in db or abs(db[k] - q) > TOLERANCE:
-            bad.append(k)
+            bad.append(show[k])
     for k in db:
         if k not in pb:
-            bad.append(k)
+            bad.append(show[k])
     return bad
 
 
-# ---------- เทียบ PO vs DO (ชุดข้อมูลของบริษัทเดียว) ----------
+def lot_mismatch_detail(po_items, do_items):
+    """คืน (ข้อความ Lot ฝั่ง PO ที่มีปัญหา, ข้อความ Lot ฝั่ง DO ที่มีปัญหา) พร้อมจำนวนในวงเล็บ"""
+    canon = make_lot_canon([it["lot_number"] for it in po_items + do_items])
+
+    def bucket(items):
+        qty, names = {}, {}
+        for it in items:
+            k = canon(it["lot_number"])
+            qty[k] = qty.get(k, 0) + it["quantity"]
+            nm = str(it["lot_number"] or "-")
+            if nm not in names.setdefault(k, []):
+                names[k].append(nm)
+        return qty, names
+
+    pq, pn = bucket(po_items)
+    dq, dn = bucket(do_items)
+    po_bad, do_bad = [], []
+    for k, q in pq.items():
+        if k not in dq or abs(dq[k] - q) > TOLERANCE:
+            po_bad.append(f"{'/'.join(pn[k])} ({q:g})")
+            if k in dq:
+                do_bad.append(f"{'/'.join(dn[k])} ({dq[k]:g})")
+    for k, q in dq.items():
+        if k not in pq:
+            do_bad.append(f"{'/'.join(dn[k])} ({q:g})")
+    return ", ".join(po_bad) or "-", ", ".join(do_bad) or "-"
+
+
+# ---------------- ตัวช่วยสร้างข้อความ (ไม่กระทบการจับคู่) ----------------
+def _clean(s):
+    return " ".join(str(s).split())
+
+
+def suspect_list(po_items, do_items):
+    """ชื่อฝั่ง DO ที่ต่างจาก PO ถ้าไม่มีให้ใช้ชื่อ DO ทั้งหมด"""
+    po_keys = {base_name_key(p["description"]) for p in po_items}
+    sus = sorted({_clean(d["description"]) for d in do_items
+                  if d["description"] and base_name_key(d["description"]) not in po_keys})
+    if not sus:
+        sus = sorted({_clean(d["description"]) for d in do_items if d["description"]})
+    return sus
+
+
+def suspect_names(po_items, do_items):
+    return " / ".join(suspect_list(po_items, do_items)) or "-"
+
+
+def weak_hint(rep_desc, po_items, do_items):
+    sus = suspect_list(po_items, do_items)
+    return name_hint(rep_desc, sus[0]) if sus else "ชื่อไม่ตรงเป๊ะ"
+
+
+def _uom_set(items):
+    out = set()
+    for it in items:
+        u = str(it["uom"] or "").strip().upper()
+        if u and u not in ("NAN", "NONE"):
+            out.add(u)
+    return out
+
+
+def uom_note(po_items, do_items):
+    pu, du = _uom_set(po_items), _uom_set(do_items)
+    if pu and du and pu != du:
+        return f" | ⚠️ ต่างหน่วย PO: {', '.join(sorted(pu))} / DO: {', '.join(sorted(du))}"
+    return ""
+
+
+# ---------------- เทียบ PO vs DO (ชุดข้อมูลของบริษัทเดียว) ----------------
 def compare_po_do(items_df, do_items_df):
     po = items_df.copy()
     do = do_items_df.copy()
@@ -1577,7 +1950,37 @@ def compare_po_do(items_df, do_items_df):
     groups = group_items_by_name(po, do)
     rows = []
 
-    for group in groups:
+    # จับคู่กลุ่ม PO-only <-> DO-only ที่ชื่อใกล้เคียงกันแบบ 1 ต่อ 1 (เอาคู่ที่คล้ายที่สุดก่อน)
+    # แล้วแสดงเป็นแถวเดียวที่ฝั่ง DO (ไม่รวมกลุ่มจริง ใช้เฉพาะตอนแสดงผล)
+    def _only(g, s):
+        return all(it["source"] == s for it in g)
+
+    po_only = [i for i, g in enumerate(groups) if _only(g, "PO")]
+    do_only = [i for i, g in enumerate(groups) if _only(g, "DO")]
+
+    cands = []
+    for a in po_only:
+        ka = base_name_key(groups[a][0]["description"])
+        for b in do_only:
+            kb = base_name_key(groups[b][0]["description"])
+            if ka and kb:
+                r = SequenceMatcher(None, ka, kb).ratio()
+                if r >= NEAR_NAME_RATIO:
+                    cands.append((r, a, b))
+    cands.sort(reverse=True)
+    used_po, used_do = set(), set()
+    pair_for_do = {}          # DO group idx -> PO group idx
+    for r, a, b in cands:
+        if a in used_po or b in used_do:
+            continue
+        used_po.add(a)
+        used_do.add(b)
+        pair_for_do[b] = a
+
+    for gi, group in enumerate(groups):
+        if gi in used_po:          # แสดงรวมที่แถว DO แล้ว
+            continue
+
         po_items = [it for it in group if it["source"] == "PO"]
         do_items = [it for it in group if it["source"] == "DO"]
 
@@ -1586,18 +1989,19 @@ def compare_po_do(items_df, do_items_df):
         po_lots = set(it["lot_number"] for it in po_items)
         do_lots = set(it["lot_number"] for it in do_items)
 
-        # [รอบ 10] ชื่อที่พบบ่อยสุดจากฝั่ง PO (ไม่มี PO ค่อยใช้ DO)
+        # ชื่อที่พบบ่อยสุดจากฝั่ง PO (ไม่มี PO ค่อยใช้ DO)
         po_descs = [it["description"] for it in po_items if it["description"]]
         pool = po_descs or [it["description"] for it in do_items if it["description"]]
-        rep_desc = Counter(pool).most_common(1)[0][0] if pool else "-"
+        rep_desc = _clean(Counter(pool).most_common(1)[0][0]) if pool else "-"
 
         rep_lot = sorted(po_lots)[0] if po_lots else (sorted(do_lots)[0] if do_lots else "-")
         uom = po_items[0]["uom"] if po_items else (do_items[0]["uom"] if do_items else "")
         do_refs = sorted(set(it["do_ref"] for it in do_items if it["do_ref"]))
         order_id = ", ".join(do_refs) if do_refs else "-"
         diff = round(do_total - po_total, 3)
+        is_weak = any(it.get("weak") for it in group)
 
-        # กรณี 1: PO สั่งไว้ แต่ไม่มีใน DO เลย
+        # กรณี 1: PO สั่งไว้ แต่ไม่มีใน DO เลย (และหาชื่อใกล้เคียงใน DO ไม่ได้)
         if po_items and not do_items:
             rows.append({"order_id": "-", "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
@@ -1606,6 +2010,17 @@ def compare_po_do(items_df, do_items_df):
 
         # กรณี 2: มีใน DO แต่ PO ไม่ได้สั่ง
         if do_items and not po_items:
+            # มีชื่อใกล้เคียงฝั่ง PO -> แสดงแถวเดียว ชี้ไปที่ชื่อ PO
+            if gi in pair_for_do:
+                po_g = groups[pair_for_do[gi]]
+                po_tot = sum(it["quantity"] for it in po_g)
+                po_name = _clean(Counter(it["description"] for it in po_g
+                                         if it["description"]).most_common(1)[0][0])
+                rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
+                             "จำนวน": po_tot, "จำนวน DO": do_total, "ผลต่าง": round(do_total - po_tot, 3),
+                             "หน่วย": uom,
+                             "สถานะ": f"🔍 โปรดตรวจสอบชื่อสินค้าอีกครั้ง | 💡 ชื่อใกล้เคียงฝั่ง PO: {po_name}"})
+                continue
             rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": do_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
                          "สถานะ": "⚠️ อาจมีสินค้าเกินโปรดตรวจสอบอีกครั้ง"})
@@ -1613,9 +2028,14 @@ def compare_po_do(items_df, do_items_df):
 
         # กรณี 3: จำนวนรวมไม่ตรงกัน (สำคัญที่สุด)
         if abs(po_total - do_total) > TOLERANCE:
+            status = "❌ ตรวจสอบจำนวนอีกครั้ง"
+            if is_weak:
+                status += (f" | ⚠️ ชื่อใน DO ต่างจาก PO: {suspect_names(po_items, do_items)}"
+                           f" | 💡 {weak_hint(rep_desc, po_items, do_items)}")
+            status += uom_note(po_items, do_items)
             rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
-                         "สถานะ": "❌ ตรวจสอบจำนวนอีกครั้ง"})
+                         "สถานะ": status})
             continue
 
         # กรณี 4: เช็ค Trix เฉพาะสินค้าที่ PO เบิกเป็น (T)
@@ -1625,14 +2045,15 @@ def compare_po_do(items_df, do_items_df):
         #     (ค) Lot เดียวกับบรรทัด PO ที่ระบุ (T)
         required_t = sum(it["quantity"] for it in po_items if requires_trix(it["description"]))
         if required_t > TOLERANCE:
-            po_t_lots = {lot_key(p["lot_number"]) for p in po_items
-                         if requires_trix(p["description"]) and lot_key(p["lot_number"])}
-            marked_lots = {lot_key(d["lot_number"]) for d in do_items
-                           if is_trix_ok(d["description"]) and lot_key(d["lot_number"])}
+            canon = make_lot_canon([it["lot_number"] for it in group])
+            po_t_lots = {canon(p["lot_number"]) for p in po_items
+                         if requires_trix(p["description"]) and canon(p["lot_number"])}
+            marked_lots = {canon(d["lot_number"]) for d in do_items
+                           if is_trix_ok(d["description"]) and canon(d["lot_number"])}
 
             ok_idx, bad_idx = [], []
             for idx, d in enumerate(do_items):
-                lk = lot_key(d["lot_number"])
+                lk = canon(d["lot_number"])
                 if is_trix_ok(d["description"]) or lk in marked_lots or lk in po_t_lots:
                     ok_idx.append(idx)
                 else:
@@ -1647,28 +2068,29 @@ def compare_po_do(items_df, do_items_df):
                              "สถานะ": f"❌ อาจเบิกผิดชนิดสินค้า (PO เบิก (T) {required_t:g} แต่ DO เป็น (T)/TRIX {got_t:g}) — Lot ที่ไม่ใช่ Trix: {bad_lots}"})
                 continue
 
-        # กรณี 4.5 [รอบ 10]: ผ่านทุกอย่าง แต่กลุ่มถูกผูกด้วย Lot ที่ชื่อไม่ตรงเป๊ะ
-        if any(it.get("weak") for it in group):
-            names = " / ".join(sorted({str(it["description"]) for it in do_items if it["description"]})) or "-"
+        # กรณี 4.5: ผ่านทุกอย่าง แต่กลุ่มถูกผูกด้วย Lot/ความใกล้เคียงที่ชื่อไม่ตรงเป๊ะ
+        if is_weak:
             rows.append({"order_id": order_id, "lot_number": rep_lot, "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
-                         "สถานะ": f"⚠️ ตรวจสอบชื่อสินค้าอีกครั้ง ({names})"})
+                         "สถานะ": (f"⚠️ อาจมีสินค้าเกินโปรดตรวจสอบชื่อสินค้าอีกครั้ง "
+                                   f"(ชื่อที่สงสัยใน DO: {suspect_names(po_items, do_items)})"
+                                   f" | 💡 {weak_hint(rep_desc, po_items, do_items)}"
+                                   + uom_note(po_items, do_items))})
             continue
 
         # กรณี 5: จำนวนรวมตรง แต่รายล็อตไม่ตรง (เตือนเฉยๆ)
         bad_lots = lot_level_mismatch(po_items, do_items)
         if bad_lots:
+            po_lot_txt, do_lot_txt = lot_mismatch_detail(po_items, do_items)
             rows.append({"order_id": order_id, "lot_number": ", ".join(bad_lots), "สินค้า": rep_desc,
                          "จำนวน": po_total, "จำนวน DO": do_total, "ผลต่าง": diff, "หน่วย": uom,
-                         "สถานะ": "⚠️ มี Lot ไม่ตรง"})
+                         "สถานะ": f"⚠️ มี Lot ไม่ตรง | ลอทใน PO: {po_lot_txt} | ลอทใน DO: {do_lot_txt}"})
             continue
 
     return pd.DataFrame(rows)
 
 
-# ==================================================================
-# ตารางเทียบน้ำหนักรวมระดับบริษัท (PO vs DO)
-# ==================================================================
+# ---------------- ตารางเทียบน้ำหนักรวมระดับบริษัท (PO vs DO) ----------------
 def normalize_company_name(s):
     s = str(s or "")
     s = THAI_CHAR_PATTERN.sub(" ", s)
@@ -1694,7 +2116,7 @@ def company_name_similarity(a, b, min_prefix=2):
 
 def match_companies(po_totals, do_totals, threshold=None):
     """คืน list ของ (do_idx, po_idx หรือ None) ด้วยตรรกะเดียวกับตารางบริษัท
-    threshold=None -> ใช้ค่า SIMILARITY_THRESHOLD ปัจจุบัน (ให้สไลเดอร์ในเว็บมีผลจริง)"""
+    threshold=None -> ใช้ค่า SIMILARITY_THRESHOLD ปัจจุบัน (ให้ slider มีผล)"""
     if threshold is None:
         threshold = SIMILARITY_THRESHOLD
     out = []
@@ -1773,12 +2195,13 @@ def style_company_compare(compare_df):
 
 
 def style_mismatch_df(df):
-    """ไฮไลต์ตารางรายการไม่ตรง ตามสีของ emoji สถานะ (แดง = ผิด, เหลือง = เตือน)"""
+    """ไฮไลต์ตารางรายการไม่ตรง ตามสีของ emoji สถานะ
+    ❌ = แดง | ⚠️ / 🔍 = เหลือง"""
     def highlight_row(row):
         status = str(row.get("สถานะ", ""))
         if status.startswith("❌"):
             color = "background-color: #FFC7CE"
-        elif status.startswith("⚠️"):
+        elif status.startswith("⚠️") or status.startswith("🔍"):
             color = "background-color: #FFEB9C"
         else:
             color = "background-color: #C6EFCE"
@@ -1787,7 +2210,7 @@ def style_mismatch_df(df):
     return df.style.apply(highlight_row, axis=1)
 
 
-# ---------- [รอบ 10] เทียบสินค้าแยกตามบริษัท (ไม่ปน PO/DO ข้ามบริษัท) ----------
+# ---------------- เทียบสินค้าแยกตามบริษัท (ไม่ปน PO/DO ข้ามบริษัท) ----------------
 def compare_po_do_by_company(items_df, do_items_df):
     po_tot = summarize_company_totals(items_df, group_by_file=False).reset_index(drop=True)
     do_tot = summarize_do_totals(do_items_df, group_by_do_ref=True).reset_index(drop=True)
@@ -1873,8 +2296,7 @@ def main():
         st.caption("ปรับได้ถ้าเจอเคสแปลกๆ ไม่แน่ใจไม่ต้องแก้ ใช้ค่าเริ่มต้นได้เลย")
         similarity_threshold_ui = st.slider(
             "ความคล้ายชื่อบริษัทขั้นต่ำ", 0.50, 1.00, SIMILARITY_THRESHOLD, 0.01,
-            help="ใช้จับคู่ชื่อบริษัทระหว่าง PO กับ DO (ทั้งตารางน้ำหนักรวมและการเทียบสินค้าแยกบริษัท) "
-                 "ค่ายิ่งสูง ยิ่งเข้มงวด ส่วนการจับกลุ่มสินค้าใช้ชื่อสินค้า/Lot ไม่ใช้ค่านี้")
+            help="ใช้จับคู่บริษัทฝั่ง PO กับ DO ค่ายิ่งสูง ยิ่งเข้มงวด ต้องชื่อบริษัทคล้ายกันมากถึงจะถือว่าเป็นบริษัทเดียวกัน")
         tolerance_ui = st.number_input(
             "ค่าคลาดเคลื่อนจำนวน/น้ำหนักที่ยอมรับได้", 0.0, 50.0, TOLERANCE, 0.01,
             help="ถ้าจำนวน PO กับ DO ต่างกันไม่เกินนี้ ถือว่าตรงกัน")
@@ -1930,6 +2352,7 @@ def main():
                     do_totals = summarize_do_totals(do_items_df, group_by_do_ref=True)
                     company_compare_df = build_company_compare_table(
                         po_totals, do_totals, threshold=SIMILARITY_THRESHOLD)
+                    # STEP 5 รอบ 20: เทียบแยกตามบริษัท (ไม่ปน PO/DO ข้ามบริษัท)
                     mismatch_df = compare_po_do_by_company(items_df, do_items_df)
                     suspicious_df = sanity_check_df(items_df)
 
